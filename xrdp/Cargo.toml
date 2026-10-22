@@ -1,0 +1,15 @@
+[package]
+name = "xrdp-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = "0.37.0"
+keyring = "4.2.0"
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+shlex = "2.0.1"
+toml = "1.1.8"
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
