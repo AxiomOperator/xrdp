@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -282,9 +282,8 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        match fs::read_to_string(&path) {
+    pub fn load(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
             Ok(text) => {
                 let mut config: Self =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -296,8 +295,7 @@ impl Config {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+    pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
@@ -305,7 +303,7 @@ impl Config {
         // Write to a temp file and rename so a crash never leaves a truncated config.
         let tmp = path.with_extension("toml.tmp");
         fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 

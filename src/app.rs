@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, Key as KeyCode, KeyboardShortcut, Modifiers, RichText};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::command::{self, Credentials};
@@ -14,6 +17,22 @@ use crate::notify;
 use crate::probe::{Prober, Reach, Target};
 use crate::secrets::{self, Key};
 use crate::session::{Session, Status};
+use crate::single_instance::Primary;
+
+/// eframe storage key for the last selected item.
+const SELECTION_KEY: &str = "selection";
+const SEARCH_ID: &str = "connection_search";
+
+const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::N);
+const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::S);
+const SHORTCUT_FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::F);
+
+/// What was selected in the sidebar, restored on the next start.
+#[derive(Serialize, Deserialize)]
+enum Selection {
+    Connection(Uuid),
+    Group(String),
+}
 
 const RESOLUTIONS: &[(u32, u32)] = &[
     (1280, 720),
@@ -107,6 +126,7 @@ enum Action {
 
 pub struct App {
     config: Config,
+    config_path: std::path::PathBuf,
     /// Set when the config file failed to load; saving is disabled so it is not clobbered.
     load_error: Option<String>,
     draft: Option<Draft>,
@@ -122,19 +142,40 @@ pub struct App {
     notice: Option<(String, bool)>,
     prober: Prober,
     actions: Vec<Action>,
+    /// Keeps the single-instance lock for as long as the app runs.
+    _instance: Option<Primary>,
+    /// Set when another launch asked this window to come to the front.
+    show_requested: Option<Arc<AtomicBool>>,
+    /// Notices from background work (e.g. saving a log file).
+    inbox: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (config, load_error) = match Config::load() {
+    pub fn new(cc: &eframe::CreationContext<'_>, instance: Option<Primary>) -> Self {
+        let path = Config::path().unwrap_or_else(|_| "xrdp-gui.toml".into());
+        Self::with_config_path(cc, instance, path)
+    }
+
+    fn with_config_path(
+        cc: &eframe::CreationContext<'_>,
+        instance: Option<Primary>,
+        config_path: std::path::PathBuf,
+    ) -> Self {
+        let (config, load_error) = match Config::load(&config_path) {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(format!("{e:#}"))),
         };
-        let notice = load_error
+        let mut notice = load_error
             .as_ref()
             .map(|e| (format!("Config not loaded, saving disabled: {e}"), true));
-        Self {
+        let show_requested = instance.as_ref().and_then(|p| {
+            p.listen(cc.egui_ctx.clone())
+                .inspect_err(|e| notice = Some((format!("{e:#}"), true)))
+                .ok()
+        });
+        let mut app = Self {
             config,
+            config_path,
             load_error,
             draft: None,
             group_draft: None,
@@ -149,7 +190,124 @@ impl App {
             notice,
             prober: Prober::new(cc.egui_ctx.clone()),
             actions: Vec::new(),
+            _instance: instance,
+            show_requested,
+            inbox: Arc::default(),
+        };
+        match cc.storage.and_then(|s| eframe::get_value(s, SELECTION_KEY)) {
+            Some(Selection::Connection(id)) => {
+                app.draft = app.find(id).cloned().map(|c| Draft::new(c, false));
+            }
+            Some(Selection::Group(name)) if app.config.group_names().contains(&name) => {
+                app.group_draft = Some(GroupDraft::new(&app.config, &name));
+            }
+            _ => {}
         }
+        app
+    }
+
+    fn selection(&self) -> Option<Selection> {
+        match (&self.draft, &self.group_draft) {
+            (Some(d), _) if !d.is_new => Some(Selection::Connection(d.conn.id)),
+            (_, Some(g)) if !g.original.name.is_empty() => {
+                Some(Selection::Group(g.original.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let modal_open = self.prompt.is_some()
+            || self.confirm_delete.is_some()
+            || self.settings_draft.is_some()
+            || self.confirm_quit;
+        if modal_open {
+            return;
+        }
+        let (new, save, find) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SHORTCUT_NEW),
+                i.consume_shortcut(&SHORTCUT_SAVE),
+                i.consume_shortcut(&SHORTCUT_FIND),
+            )
+        });
+        if new {
+            self.actions.push(Action::NewConnection);
+        }
+        if save && (self.conn_dirty() || self.group_dirty()) {
+            self.actions.push(Action::Save);
+        }
+        if find {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::unique(SEARCH_ID)));
+        }
+
+        // Plain keys only apply when no text field is being typed into.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let Some(d) = self.draft.as_ref().filter(|d| !d.is_new) else {
+            return;
+        };
+        let id = d.conn.id;
+        let (enter, delete) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, KeyCode::Enter),
+                i.consume_key(Modifiers::NONE, KeyCode::Delete),
+            )
+        });
+        if enter {
+            self.actions.push(Action::Connect(id));
+        }
+        if delete {
+            self.actions.push(Action::AskDelete(id));
+        }
+    }
+
+    fn save_log(&self, index: usize, ctx: &egui::Context) {
+        let Some(s) = self.sessions.get(index) else {
+            return;
+        };
+        let report = s.report();
+        let safe_name: String = s
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file_name = format!(
+            "xrdp-gui-{safe_name}-{}.log",
+            s.started_at.format("%Y%m%d-%H%M%S")
+        );
+        let inbox = self.inbox.clone();
+        let ctx = ctx.clone();
+        // The file dialog blocks, so run it off the UI thread.
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save session log")
+                .set_file_name(file_name)
+                .add_filter("Log file", &["log", "txt"]);
+            if let Some(dir) = directories::UserDirs::new().and_then(|u| {
+                u.download_dir()
+                    .or(u.document_dir())
+                    .map(|p| p.to_path_buf())
+            }) {
+                dialog = dialog.set_directory(dir);
+            }
+            let Some(path) = dialog.save_file() else {
+                return;
+            };
+            let notice = match std::fs::write(&path, report) {
+                Ok(()) => (format!("Saved log to {}", path.display()), false),
+                Err(e) => (format!("Couldn't save {}: {e}", path.display()), true),
+            };
+            inbox.lock().unwrap().push(notice);
+            ctx.request_repaint();
+        });
     }
 
     // ---- state helpers -------------------------------------------------------------
@@ -191,7 +349,7 @@ impl App {
         if let Some(e) = &self.load_error {
             bail!("not saving: config failed to load ({e})");
         }
-        self.config.save()
+        self.config.save(&self.config_path)
     }
 
     fn save_draft(&mut self) -> Result<()> {
@@ -723,7 +881,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading("xrdp-gui");
             ui.separator();
-            if ui.button("➕ Connection").clicked() {
+            if ui.button("➕ Connection").on_hover_text("Ctrl+N").clicked() {
                 self.actions.push(Action::NewConnection);
             }
             if ui
@@ -756,9 +914,11 @@ impl App {
     fn connection_list(&mut self, ui: &mut egui::Ui) {
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text("🔍 Search")
+                .id(egui::Id::unique(SEARCH_ID))
+                .hint_text("🔍 Search (Ctrl+F)")
                 .desired_width(f32::INFINITY),
-        );
+        )
+        .accessible_name("Search connections");
         ui.add_space(4.0);
 
         let query = self.search.trim().to_lowercase();
@@ -867,12 +1027,15 @@ impl App {
                 let connect = egui::Button::new(RichText::new("▶ Connect").strong());
                 if ui
                     .add_enabled(!d.conn.host.trim().is_empty(), connect)
+                    .on_hover_text("Enter")
                     .clicked()
                 {
                     actions.push(Action::Connect(id));
                 }
                 if ui
                     .add_enabled(dirty, egui::Button::new("💾 Save"))
+                    .on_hover_text("Ctrl+S")
+                    .on_disabled_hover_text("No unsaved changes (Ctrl+S)")
                     .clicked()
                 {
                     actions.push(Action::Save);
@@ -891,6 +1054,7 @@ impl App {
                 }
                 if ui
                     .add_enabled(!d.is_new, egui::Button::new("🗑 Delete"))
+                    .on_hover_text("Delete")
                     .clicked()
                 {
                     actions.push(Action::AskDelete(id));
@@ -908,7 +1072,8 @@ impl App {
                     row(ui, "Name", |ui| ui.text_edit_singleline(&mut c.name));
                     row(ui, "Group", |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut c.group).hint_text("none"));
+                            ui.add(egui::TextEdit::singleline(&mut c.group).hint_text("none"))
+                                .accessible_name("Group");
                             egui::ComboBox::from_id_salt("group_pick")
                                 .selected_text("")
                                 .width(20.0)
@@ -917,7 +1082,9 @@ impl App {
                                     for g in &group_names {
                                         ui.selectable_value(&mut c.group, g.clone(), g);
                                     }
-                                });
+                                })
+                                .response
+                                .accessible_name("Choose an existing group");
                         })
                         .response
                     });
@@ -942,9 +1109,13 @@ impl App {
                         ui.add(egui::TextEdit::singleline(&mut c.domain).hint_text(hint))
                     });
                     row(ui, "Password", |ui| {
-                        password_field(ui, &mut d.password, c.has_saved_password, || {
-                            actions.push(Action::Forget(Key::Rdp(id)))
-                        })
+                        password_field(
+                            ui,
+                            "Password",
+                            &mut d.password,
+                            c.has_saved_password,
+                            || actions.push(Action::Forget(Key::Rdp(id))),
+                        )
                     });
                 });
 
@@ -963,9 +1134,11 @@ impl App {
                     } else {
                         row(ui, "Size", |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut c.width).range(640..=8192));
+                                ui.add(egui::DragValue::new(&mut c.width).range(640..=8192))
+                                    .accessible_name("Width");
                                 ui.label("×");
-                                ui.add(egui::DragValue::new(&mut c.height).range(480..=8192));
+                                ui.add(egui::DragValue::new(&mut c.height).range(480..=8192))
+                                    .accessible_name("Height");
                                 egui::ComboBox::from_id_salt("res_presets")
                                     .selected_text("Presets")
                                     .show_ui(ui, |ui| {
@@ -974,7 +1147,9 @@ impl App {
                                                 (c.width, c.height) = (w, h);
                                             }
                                         }
-                                    });
+                                    })
+                                    .response
+                                    .accessible_name("Resolution presets");
                             })
                             .response
                         });
@@ -1016,7 +1191,8 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::DragValue::new(&mut c.reconnect_retries).range(0..=1000),
-                                );
+                                )
+                                .accessible_name("Reconnect retries");
                                 ui.weak(if c.reconnect_retries == 0 {
                                     "unlimited"
                                 } else {
@@ -1087,6 +1263,7 @@ impl App {
                                 row(ui, "Password", |ui| {
                                     password_field(
                                         ui,
+                                        "Gateway password",
                                         &mut d.gateway_password,
                                         c.has_saved_gateway_password,
                                         || actions.push(Action::Forget(Key::Gateway(id))),
@@ -1161,6 +1338,8 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(dirty, egui::Button::new("💾 Save"))
+                    .on_hover_text("Ctrl+S")
+                    .on_disabled_hover_text("No unsaved changes (Ctrl+S)")
                     .clicked()
                 {
                     actions.push(Action::Save);
@@ -1247,6 +1426,7 @@ impl App {
                             row(ui, "Password", |ui| {
                                 password_field(
                                     ui,
+                                    "Gateway password",
                                     &mut g.gateway_password,
                                     gr.has_saved_gateway_password,
                                     || actions.push(Action::Forget(key)),
@@ -1371,8 +1551,28 @@ impl App {
                 }
             });
 
-        if let Some(s) = self.log_session.and_then(|i| self.sessions.get(i)) {
+        if let Some(i) = self.log_session.filter(|&i| i < self.sessions.len()) {
             ui.separator();
+            let (mut copy, mut save) = (false, false);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Log: {}", self.sessions[i].name)).strong());
+                copy = ui
+                    .small_button("📋 Copy log")
+                    .on_hover_text("Copy the log with connection details (passwords masked)")
+                    .clicked();
+                save = ui
+                    .small_button("💾 Save log…")
+                    .on_hover_text("Save the log with connection details (passwords masked)")
+                    .clicked();
+            });
+            if copy {
+                ui.ctx().copy_text(self.sessions[i].report());
+                self.notice = Some(("Log copied to the clipboard".into(), false));
+            }
+            if save {
+                self.save_log(i, ui.ctx());
+            }
+            let s = &self.sessions[i];
             let out = s.output.lock().unwrap();
             egui::ScrollArea::both()
                 .id_salt("session_log")
@@ -1397,17 +1597,21 @@ impl App {
                 ui.heading("Password");
                 ui.label(format!("Connecting to {}", p.target));
                 ui.add_space(6.0);
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut p.password)
-                        .password(true)
-                        .hint_text("Leave empty to let FreeRDP ask")
-                        .desired_width(f32::INFINITY),
-                );
+                let field = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut p.password)
+                            .password(true)
+                            .hint_text("Leave empty to let FreeRDP ask")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .accessible_name("Password");
                 field.request_focus();
                 ui.checkbox(&mut p.remember, "Save in keyring");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    // The field re-takes focus every frame, so it never reports losing it on
+                    // Enter; treat Enter anywhere in this dialog as "Connect".
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Connect").clicked() || enter {
                         self.actions.push(Action::Launch);
                     }
@@ -1458,7 +1662,8 @@ impl App {
                     .show(ui, |ui| {
                         ui.label("FreeRDP client");
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut s.client);
+                            ui.text_edit_singleline(&mut s.client)
+                                .accessible_name("FreeRDP client");
                             egui::ComboBox::from_id_salt("client_presets")
                                 .selected_text("")
                                 .width(20.0)
@@ -1466,7 +1671,9 @@ impl App {
                                     for c in CLIENTS {
                                         ui.selectable_value(&mut s.client, c.to_string(), *c);
                                     }
-                                });
+                                })
+                                .response
+                                .accessible_name("Client presets");
                         });
                         ui.end_row();
                         ui.label("Log level");
@@ -1476,7 +1683,9 @@ impl App {
                                 for l in LOG_LEVELS {
                                     ui.selectable_value(&mut s.log_level, l.to_string(), *l);
                                 }
-                            });
+                            })
+                            .response
+                            .accessible_name("Log level");
                         ui.end_row();
                         ui.label("");
                         ui.checkbox(&mut s.probe_hosts, "Check whether hosts are reachable");
@@ -1533,10 +1742,34 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        match self.selection() {
+            Some(sel) => eframe::set_value(storage, SELECTION_KEY, &sel),
+            None => storage.set_string(SELECTION_KEY, String::new()),
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_sessions();
         self.update_probe_targets();
+        self.handle_shortcuts(&ctx);
+
+        if self
+            .show_requested
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::SeqCst))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // Wayland compositors may refuse to steal focus; flag the window instead.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
+        if let Some(n) = self.inbox.lock().unwrap().pop() {
+            self.notice = Some(n);
+        }
 
         let any_running = self.sessions.iter().any(Session::is_running);
         if any_running {
@@ -1664,13 +1897,18 @@ fn section(ui: &mut egui::Ui, title: &str, open: bool, body: impl FnOnce(&mut eg
 }
 
 fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> egui::Response) {
-    ui.label(label);
-    add(ui);
+    let label_id = ui.label(label).id;
+    let field = add(ui);
+    if !label.is_empty() {
+        // Lets screen readers announce the field by its label.
+        field.labelled_by(label_id);
+    }
     ui.end_row();
 }
 
 fn password_field(
     ui: &mut egui::Ui,
+    name: &str,
     value: &mut String,
     saved: bool,
     forget: impl FnOnce(),
@@ -1685,7 +1923,8 @@ fn password_field(
             egui::TextEdit::singleline(value)
                 .password(true)
                 .hint_text(hint),
-        );
+        )
+        .accessible_name(name);
         if saved
             && ui
                 .small_button("Forget")
@@ -1733,7 +1972,7 @@ fn command_preview(
 ) {
     match command::build_args(resolved, settings, creds) {
         Ok(args) => {
-            let preview = command::preview(settings, &args);
+            let preview = command::preview(&settings.client, &args);
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::Label::new(RichText::new(&preview).monospace().weak()).wrap());
                 if ui
@@ -1749,5 +1988,336 @@ fn command_preview(
         Err(e) => {
             ui.colored_label(ui.visuals().warn_fg_color, format!("{e:#}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    //! Drives the real UI headlessly: key presses and clicks go through egui exactly as
+    //! they would from the keyboard and mouse.
+
+    use super::*;
+    use egui::accesskit::Role;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    struct TestEnv {
+        dir: PathBuf,
+    }
+
+    impl TestEnv {
+        /// A throwaway config with one connection whose client is a fake FreeRDP that
+        /// fails with a logon error.
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("xrdp-gui-ui-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let client = dir.join("fake-freerdp");
+            std::fs::write(
+                &client,
+                "#!/bin/sh\ncat >/dev/null\n\
+                 echo '[ERROR][com.freerdp.core] - [nla]: ERRCONNECT_LOGON_FAILURE [0x00020014]' >&2\n\
+                 exit 134\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = Config {
+                settings: Settings {
+                    client: client.to_string_lossy().into(),
+                    probe_hosts: false,
+                    notifications: false,
+                    ..Default::default()
+                },
+                groups: vec![Group {
+                    name: "Work".into(),
+                    domain: "CORP".into(),
+                    ..Default::default()
+                }],
+                connections: vec![
+                    Connection {
+                        name: "Alpha".into(),
+                        host: "127.0.0.1".into(),
+                        username: "alice".into(),
+                        ..Default::default()
+                    },
+                    Connection {
+                        name: "Beta".into(),
+                        group: "Work".into(),
+                        host: "127.0.0.2".into(),
+                        ..Default::default()
+                    },
+                ],
+            };
+            let env = Self { dir };
+            config.save(&env.config_path()).unwrap();
+            env
+        }
+
+        fn config_path(&self) -> PathBuf {
+            self.dir.join("config.toml")
+        }
+
+        fn harness(&self) -> Harness<'static, App> {
+            self.harness_with_storage(None)
+        }
+
+        /// Starts the app as eframe would on launch, optionally with previously saved state.
+        fn harness_with_storage(
+            &self,
+            storage: Option<&'static MemStorage>,
+        ) -> Harness<'static, App> {
+            let path = self.config_path();
+            let mut h = Harness::builder()
+                .with_size([1100.0, 760.0])
+                // The harness has no system fonts; draw boxes for icons instead of panicking.
+                .allow_missing_glyphs()
+                .build_eframe(move |cc| {
+                    cc.storage = storage.map(|s| s as &dyn eframe::Storage);
+                    App::with_config_path(cc, None, path)
+                });
+            h.run_steps(2);
+            h
+        }
+    }
+
+    /// Stands in for eframe's on-disk app state (`~/.local/share/xrdp-gui/app.ron`).
+    #[derive(Default)]
+    struct MemStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    /// Saves the app's state the way eframe does on exit or autosave.
+    fn saved_state(h: &mut Harness<'static, App>) -> &'static MemStorage {
+        let mut storage = MemStorage::default();
+        eframe::App::save(h.state_mut(), &mut storage);
+        Box::leak(Box::new(storage))
+    }
+
+    #[test]
+    fn restores_last_selection() {
+        let env = TestEnv::new("restore");
+
+        // Select a connection, save state, and start a fresh app from it.
+        let mut h = env.harness();
+        h.get_by_label_contains("Beta").click();
+        h.run_steps(3);
+        let beta = h
+            .state()
+            .draft
+            .as_ref()
+            .map(|d| d.conn.id)
+            .expect("Beta selected");
+        let storage = saved_state(&mut h);
+        drop(h);
+        let h = env.harness_with_storage(Some(storage));
+        let restored = h.state().draft.as_ref().map(|d| d.conn.id);
+        assert_eq!(
+            restored,
+            Some(beta),
+            "last selected connection should be restored"
+        );
+        // …and shown in the editor.
+        assert!(
+            h.query_by(|n| n.role() == Role::TextInput && n.value().as_deref() == Some("Beta"))
+                .is_some(),
+            "the restored connection should be open in the editor"
+        );
+
+        // Same for a group whose defaults were being edited.
+        let mut h = env.harness();
+        h.get_by_label("Work  ⚙").click();
+        h.run_steps(3);
+        assert!(
+            h.state().group_draft.is_some(),
+            "clicking the group header should open it"
+        );
+        let storage = saved_state(&mut h);
+        drop(h);
+        let h = env.harness_with_storage(Some(storage));
+        let restored = h
+            .state()
+            .group_draft
+            .as_ref()
+            .map(|g| g.original.name.clone());
+        assert_eq!(
+            restored.as_deref(),
+            Some("Work"),
+            "last selected group should be restored"
+        );
+
+        // A selection that no longer exists is ignored rather than crashing.
+        let mut stale = MemStorage::default();
+        eframe::set_value(
+            &mut stale,
+            SELECTION_KEY,
+            &Selection::Connection(Uuid::new_v4()),
+        );
+        let h = env.harness_with_storage(Some(Box::leak(Box::new(stale))));
+        assert!(h.state().draft.is_none() && h.state().group_draft.is_none());
+
+        // Nothing selected: nothing restored.
+        let mut h = env.harness();
+        let storage = saved_state(&mut h);
+        drop(h);
+        let h = env.harness_with_storage(Some(storage));
+        assert!(h.state().draft.is_none() && h.state().group_draft.is_none());
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn select_alpha(h: &mut Harness<'static, App>) {
+        h.get_by_label_contains("Alpha").click();
+        h.run_steps(3);
+        assert!(
+            h.state()
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.conn.name == "Alpha")
+        );
+    }
+
+    #[test]
+    fn keyboard_shortcuts() {
+        let env = TestEnv::new("shortcuts");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+
+        // Enter connects; with no saved password that starts with the password prompt.
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+        assert!(h.state().prompt.is_some(), "Enter should start connecting");
+        h.get_by_label("Cancel").click();
+        h.run_steps(3);
+        assert!(h.state().prompt.is_none());
+
+        // Delete asks for confirmation.
+        h.key_press(KeyCode::Delete);
+        h.run_steps(3);
+        assert!(
+            h.state().confirm_delete.is_some(),
+            "Delete should ask to delete"
+        );
+        h.get_by_label("Cancel").click();
+        h.run_steps(3);
+        assert!(h.state().confirm_delete.is_none());
+        assert_eq!(
+            h.state().config.connections.len(),
+            2,
+            "Cancel must not delete"
+        );
+
+        // Ctrl+S saves, even while typing in a field.
+        h.get_by(|n| n.role() == Role::TextInput && n.value().as_deref() == Some("Alpha"))
+            .focus();
+        h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text(" Two".into()));
+        h.run_steps(2);
+        assert!(
+            h.state().conn_dirty(),
+            "typing should make the connection dirty"
+        );
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::S);
+        h.run_steps(3);
+        assert!(!h.state().conn_dirty(), "Ctrl+S should save");
+        let saved = std::fs::read_to_string(env.config_path()).unwrap();
+        assert!(
+            saved.contains("Two"),
+            "saved config should contain the edit:\n{saved}"
+        );
+
+        // Ctrl+F jumps to search.
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::F);
+        h.run_steps(3);
+        h.input_mut().events.push(egui::Event::Text("zzz".into()));
+        h.run_steps(3);
+        assert_eq!(
+            h.state().search,
+            "zzz",
+            "Ctrl+F should focus the search box"
+        );
+
+        // Ctrl+N starts a new connection.
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::N);
+        h.run_steps(3);
+        assert!(
+            h.state().draft.as_ref().is_some_and(|d| d.is_new),
+            "Ctrl+N should create a connection"
+        );
+    }
+
+    #[test]
+    fn copy_log_button() {
+        let env = TestEnv::new("copylog");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+
+        // Connect via Enter, then Enter again in the password prompt (empty password).
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+        assert!(h.state().prompt.is_some());
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+        assert!(
+            h.state().prompt.is_none(),
+            "Enter in the password prompt should connect"
+        );
+        assert_eq!(h.state().sessions.len(), 1, "a session should have started");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.state().sessions[0].is_running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake client did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            h.step();
+        }
+        h.run_steps(2);
+
+        h.get_by_label("Log").click();
+        h.run_steps(3);
+        h.get_by_label("📋 Copy log").click();
+        let mut copied = None;
+        for _ in 0..4 {
+            h.step();
+            copied = copied.or_else(|| {
+                h.output()
+                    .platform_output
+                    .commands
+                    .iter()
+                    .find_map(|c| match c {
+                        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                        _ => None,
+                    })
+            });
+        }
+        let copied = copied.expect("Copy log should put text on the clipboard");
+        assert!(copied.contains("Connection: Alpha"), "{copied}");
+        assert!(
+            copied.contains("failed: Wrong username or password [ERRCONNECT_LOGON_FAILURE]"),
+            "{copied}"
+        );
+        assert!(
+            copied.contains("ERRCONNECT_LOGON_FAILURE [0x00020014]"),
+            "log lines missing:\n{copied}"
+        );
     }
 }

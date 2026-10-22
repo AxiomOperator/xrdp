@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=xrdp-gui
+GenericName=Remote Desktop Client
+Comment=Manage and launch FreeRDP remote desktop connections
+Exec=xrdp-gui
+Icon=xrdp-gui
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=rdp;remote;desktop;freerdp;windows;terminal server;
+StartupWMClass=xrdp-gui
+StartupNotify=true
+SingleMainWindow=true

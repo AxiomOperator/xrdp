@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xrdp-gui session
+Comment=Remote desktop session started from xrdp-gui
+Exec=xrdp-gui
+Icon=xrdp-gui
+Terminal=false
+NoDisplay=true
+StartupWMClass=xrdp-gui-session

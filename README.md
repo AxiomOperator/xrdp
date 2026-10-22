@@ -19,7 +19,33 @@ It stores your RDP connections and launches `sdl-freerdp` (or `xfreerdp`) for th
 - Arguments are passed to FreeRDP via `/args-from:stdin`, so passwords never show up in `ps`
 - Display options (window/fullscreen, size presets, multi-monitor, dynamic resolution)
 - Redirection (clipboard, home drive, audio, microphone), extra args
-- Session list with live FreeRDP log output and disconnect
+- Session list with live FreeRDP log output and disconnect; **copy or save a session's log**
+  (with connection details, passwords masked) to send to support
+- Only one copy runs at a time; launching it again brings the existing window forward
+- Remembers window size, position, panel widths and the last selected connection or group
+  (on Wayland the position is remembered by a KWin window rule that `install.sh` adds)
+
+## Install
+
+```sh
+./install.sh            # builds and installs for your user into ~/.local
+./install.sh --uninstall
+```
+
+This puts `xrdp-gui` in `~/.local/bin`, adds it to the application menu (Internet / Network),
+installs its icon, and adds a KWin rule so KDE remembers where you put the window. Set `PREFIX` to install somewhere else.
+
+## Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| Enter | Connect to the selected connection |
+| Ctrl+N | New connection |
+| Ctrl+S | Save |
+| Ctrl+F | Search |
+| Delete | Delete the selected connection |
+
+Enter and Delete apply when you're not typing in a field.
 
 ## Build & run
 

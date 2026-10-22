@@ -5,6 +5,11 @@ use anyhow::{Result, bail};
 
 use crate::model::{CertPolicy, GatewayTarget, Resolved, Settings};
 
+/// Window class / app id for session windows. It matches `xrdp-gui-session.desktop`, so
+/// the desktop shows our icon on them, while keeping them apart from the main window
+/// (and its remember-position rule).
+pub const SESSION_APP_ID: &str = "xrdp-gui-session";
+
 /// FreeRDP logs reconnect attempts at INFO under this tag; we watch for them.
 const RECONNECT_LOG_TAG: &str = "com.freerdp.client.common";
 
@@ -30,6 +35,8 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
         args.push(format!("/p:{p}"));
     }
     args.push(format!("/t:{}", conn.display_name()));
+    // xfreerdp (X11/XWayland) reads this; sdl-freerdp gets SDL_APP_ID instead (see Session::spawn).
+    args.push(format!("/wm-class:{SESSION_APP_ID}"));
 
     if conn.fullscreen {
         args.push("+f".into());
@@ -179,8 +186,8 @@ pub fn mask(arg: &str) -> String {
 }
 
 /// A shell-quoted, password-masked rendering of the full command line.
-pub fn preview(settings: &Settings, args: &[String]) -> String {
-    std::iter::once(settings.client.clone())
+pub fn preview(client: &str, args: &[String]) -> String {
+    std::iter::once(client.to_string())
         .chain(args.iter().map(|a| {
             let m = mask(a);
             shlex::try_quote(&m).map(|q| q.into_owned()).unwrap_or(m)
@@ -227,6 +234,7 @@ mod tests {
                 "/u:alice",
                 "/d:CORP",
                 "/t:Lab",
+                "/wm-class:xrdp-gui-session",
                 "/size:1600x900",
                 "+dynamic-resolution",
                 "/sound",
@@ -297,7 +305,7 @@ mod tests {
         assert!(args.contains(&"/p:s3cret pass".into()));
         assert!(args.contains(&"/gateway:g:gw.example.com,u:alice,d:CORP,p:s3cret pass".into()));
 
-        let shown = preview(&Settings::default(), &args);
+        let shown = preview("sdl-freerdp", &args);
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(shown.contains("/gateway:g:gw.example.com,u:alice,d:CORP,p:***"));
     }

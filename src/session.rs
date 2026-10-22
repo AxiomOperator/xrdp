@@ -7,10 +7,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local};
 use eframe::egui;
 use uuid::Uuid;
 
-use crate::diagnose::{self, Diagnosis};
+use crate::command;
+use crate::diagnose::{self, Diagnosis, Severity};
 
 const MAX_LOG_LINES: usize = 5000;
 /// With no new attempt for this long, a reconnecting session is assumed to be back.
@@ -32,6 +34,10 @@ pub struct Session {
     pub connection_id: Uuid,
     pub name: String,
     pub started: Instant,
+    pub started_at: DateTime<Local>,
+    pub ended: Option<Instant>,
+    /// The command line with passwords masked, for support reports.
+    pub command: String,
     pub status: Status,
     pub output: Arc<Mutex<Output>>,
     /// Whether the user has been told about the current reconnect episode.
@@ -52,6 +58,8 @@ impl Session {
     ) -> Result<Self> {
         let mut child = Command::new(client)
             .arg("/args-from:stdin")
+            // sdl-freerdp's Wayland app id, which picks the window's icon.
+            .env("SDL_APP_ID", command::SESSION_APP_ID)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -79,6 +87,9 @@ impl Session {
             connection_id,
             name,
             started: Instant::now(),
+            started_at: Local::now(),
+            ended: None,
+            command: command::preview(client, args),
             status: Status::Running,
             output,
             reconnect_notified: false,
@@ -98,6 +109,7 @@ impl Session {
             let diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
             drop(out);
             self.status = Status::Exited(diagnosis);
+            self.ended = Some(Instant::now());
             return true;
         }
         false
@@ -116,6 +128,49 @@ impl Session {
         out.reconnect
             .filter(|(_, _, at)| at.elapsed() < RECONNECT_QUIET)
             .map(|(n, m, _)| (n, m))
+    }
+
+    /// A self-contained, password-free report of this session for sending to support.
+    pub fn report(&self) -> String {
+        let result = match &self.status {
+            Status::Running => "still running".to_string(),
+            Status::Exited(d) => {
+                let kind = match d.severity {
+                    Severity::Normal => "ended",
+                    Severity::Dropped => "dropped",
+                    Severity::Failed => "failed",
+                };
+                let code = d
+                    .code
+                    .as_deref()
+                    .map(|c| format!(" [{c}]"))
+                    .unwrap_or_default();
+                format!("{kind}: {}{code}", d.title)
+            }
+        };
+        let out = self.output.lock().unwrap();
+        let mut report = format!(
+            "xrdp-gui {} session log\n\
+             Connection: {}\n\
+             Started:    {}\n\
+             Duration:   {}s\n\
+             Result:     {result}\n\
+             Command:    {}\n\
+             ----------------------------------------\n",
+            env!("CARGO_PKG_VERSION"),
+            self.name,
+            self.started_at.format("%Y-%m-%d %H:%M:%S %z"),
+            self.ended
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_secs(),
+            self.command,
+        );
+        for line in &out.lines {
+            report.push_str(line);
+            report.push('\n');
+        }
+        report
     }
 
     /// Asks the client to shut down gracefully.
@@ -153,4 +208,61 @@ fn pump(stream: impl Read + Send + 'static, output: Arc<Mutex<Output>>, ctx: egu
             ctx.request_repaint();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Runs a fake FreeRDP that reads its arguments, logs a logon failure and exits
+    /// with FreeRDP's logon-failure code.
+    #[test]
+    fn fake_client_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("xrdp-gui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = dir.join("fake-freerdp");
+        std::fs::write(
+            &client,
+            "#!/bin/sh\n\
+             [ \"$1\" = /args-from:stdin ] || exit 128\n\
+             echo \"got $(wc -l) args\"\n\
+             echo '[ERROR][com.freerdp.core] - [nla_client]: ERRCONNECT_LOGON_FAILURE [0x00020014]' >&2\n\
+             exit 134\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let args: Vec<String> = ["/v:host", "/u:alice", "/p:hunter2"]
+            .map(String::from)
+            .into();
+        let ctx = egui::Context::default();
+        let mut s = Session::spawn(
+            client.to_str().unwrap(),
+            &args,
+            Uuid::new_v4(),
+            "Lab".into(),
+            &ctx,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !s.poll() {
+            assert!(Instant::now() < deadline, "fake client did not exit");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let Status::Exited(d) = &s.status else {
+            unreachable!()
+        };
+        assert_eq!(d.title, "Wrong username or password");
+        let report = s.report();
+        assert!(report.contains("got 3 args"), "{report}");
+        assert!(report.contains("failed: Wrong username or password [ERRCONNECT_LOGON_FAILURE]"));
+        assert!(report.contains("/p:***"));
+        assert!(
+            !report.contains("hunter2"),
+            "password leaked into report:\n{report}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
