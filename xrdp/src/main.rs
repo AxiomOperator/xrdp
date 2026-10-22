@@ -1,6 +1,9 @@
 mod app;
 mod command;
+mod diagnose;
 mod model;
+mod notify;
+mod probe;
 mod secrets;
 mod session;
 
@@ -15,5 +18,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native("xrdp-gui", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native(
+        "xrdp-gui",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+    )
 }
