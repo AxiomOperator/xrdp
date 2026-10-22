@@ -11,6 +11,7 @@ pub enum Key {
     Rdp(Uuid),
     Gateway(Uuid),
     GroupGateway(String),
+    GroupRdp(String),
 }
 
 impl Key {
@@ -19,6 +20,7 @@ impl Key {
             Key::Rdp(id) => format!("{id}"),
             Key::Gateway(id) => format!("{id}:gateway"),
             Key::GroupGateway(name) => format!("group:{name}:gateway"),
+            Key::GroupRdp(name) => format!("group:{name}"),
         }
     }
 

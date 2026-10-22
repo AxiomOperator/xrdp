@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,51 @@ impl Profile {
     }
 }
 
+/// How the remote desktop is scaled for high-DPI screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scaling {
+    /// FreeRDP's default (100%).
+    #[default]
+    Off,
+    /// Match the scale of the screen xrdp-gui's window is on.
+    Auto,
+    Percent(u32),
+}
+
+impl Scaling {
+    pub const PRESETS: [u32; 7] = [100, 125, 150, 175, 200, 250, 300];
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Off => "Off (100%)".into(),
+            Self::Auto => format!("Match this screen ({}%)", screen_scale()),
+            Self::Percent(p) => format!("{p}%"),
+        }
+    }
+
+    /// The remote desktop scale in percent, if any.
+    pub fn percent(self) -> Option<u32> {
+        match self {
+            Self::Off => None,
+            Self::Auto => Some(screen_scale()),
+            Self::Percent(p) => Some(p),
+        }
+    }
+}
+
+/// The local screen's scale in percent, as last seen by the window (100 until then).
+static SCREEN_SCALE: AtomicU32 = AtomicU32::new(100);
+
+pub fn screen_scale() -> u32 {
+    SCREEN_SCALE.load(Ordering::Relaxed)
+}
+
+pub fn set_screen_scale(pixels_per_point: f32) {
+    let percent = (pixels_per_point * 100.0).round().clamp(100.0, 500.0) as u32;
+    SCREEN_SCALE.store(percent, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GatewayMode {
@@ -112,6 +158,7 @@ pub struct Connection {
     pub height: u32,
     pub dynamic_resolution: bool,
     pub multimon: bool,
+    pub scaling: Scaling,
 
     /// `None` inherits from the group.
     pub profile: Option<Profile>,
@@ -138,6 +185,12 @@ pub struct Connection {
     pub cert: Option<CertPolicy>,
     pub admin: bool,
     pub extra_args: String,
+
+    pub favorite: bool,
+    /// When this connection was last launched (Unix seconds).
+    pub last_used: Option<i64>,
+    pub tags: Vec<String>,
+    pub notes: String,
 }
 
 impl Default for Connection {
@@ -156,6 +209,7 @@ impl Default for Connection {
             height: 900,
             dynamic_resolution: true,
             multimon: false,
+            scaling: Scaling::Off,
             profile: None,
             auto_reconnect: true,
             reconnect_retries: 10,
@@ -173,6 +227,10 @@ impl Default for Connection {
             cert: None,
             admin: false,
             extra_args: String::new(),
+            favorite: false,
+            last_used: None,
+            tags: Vec::new(),
+            notes: String::new(),
         }
     }
 }
@@ -187,6 +245,39 @@ impl Connection {
             "(unnamed)"
         }
     }
+
+    /// Whether `query` (already lower-cased) matches this connection. `#tag` matches a
+    /// tag exactly; anything else matches part of the name, host, user, group, a tag or
+    /// the notes.
+    pub fn matches(&self, query: &str) -> bool {
+        if let Some(tag) = query.strip_prefix('#') {
+            return self.tags.iter().any(|t| t.to_lowercase() == tag);
+        }
+        [
+            &self.name,
+            &self.host,
+            &self.username,
+            &self.group,
+            &self.notes,
+        ]
+        .into_iter()
+        .chain(&self.tags)
+        .any(|f| f.to_lowercase().contains(query))
+    }
+}
+
+/// Splits "a, b,c" into tags, dropping empties and duplicates.
+pub fn parse_tags(text: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for t in text
+        .split(',')
+        .map(|t| t.trim().trim_start_matches('#').trim())
+    {
+        if !t.is_empty() && !tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            tags.push(t.to_string());
+        }
+    }
+    tags
 }
 
 /// Defaults shared by every connection in a group.
@@ -195,6 +286,9 @@ impl Connection {
 pub struct Group {
     pub name: String,
     pub domain: String,
+    /// Used by member connections that leave their own username empty.
+    pub username: String,
+    pub has_saved_password: bool,
     pub cert: Option<CertPolicy>,
     pub profile: Option<Profile>,
     pub gateway_enabled: bool,
@@ -210,6 +304,8 @@ impl Default for Group {
         Self {
             name: String::new(),
             domain: String::new(),
+            username: String::new(),
+            has_saved_password: false,
             cert: None,
             profile: None,
             gateway_enabled: false,
@@ -239,7 +335,14 @@ pub struct GatewayTarget {
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub conn: Connection,
+    pub username: String,
     pub domain: String,
+    /// Keyring entry holding the password to use, if one is saved.
+    pub password_key: Option<Key>,
+    /// The group whose credentials are used, if the connection inherits them.
+    pub creds_from_group: Option<String>,
+    /// Remote desktop scale in percent.
+    pub scale: Option<u32>,
     pub cert: CertPolicy,
     pub profile: Profile,
     pub gateway: Option<GatewayTarget>,
@@ -254,6 +357,10 @@ pub struct Settings {
     /// Periodically check whether each host's RDP port is reachable.
     pub probe_hosts: bool,
     pub notifications: bool,
+    /// Show a tray icon; closing the window then keeps xrdp-gui running in the tray.
+    pub tray: bool,
+    /// Opening a group in the sidebar closes the others.
+    pub accordion: bool,
 }
 
 impl Default for Settings {
@@ -263,6 +370,8 @@ impl Default for Settings {
             log_level: "WARN".into(),
             probe_hosts: true,
             notifications: true,
+            tray: true,
+            accordion: true,
         }
     }
 }
@@ -340,8 +449,27 @@ impl Config {
         names
     }
 
+    pub fn find(&self, id: Uuid) -> Option<&Connection> {
+        self.connections.iter().find(|c| c.id == id)
+    }
+
     pub fn resolve(&self, conn: &Connection) -> Resolved {
         let group = self.group(&conn.group);
+        // A connection without its own username uses its group's credentials.
+        let creds_group = group.filter(|g| {
+            conn.username.trim().is_empty()
+                && (!g.username.trim().is_empty() || g.has_saved_password)
+        });
+        let (username, password_key) = match creds_group {
+            Some(g) => (
+                g.username.trim().to_string(),
+                g.has_saved_password.then(|| Key::GroupRdp(g.name.clone())),
+            ),
+            None => (
+                conn.username.trim().to_string(),
+                conn.has_saved_password.then_some(Key::Rdp(conn.id)),
+            ),
+        };
         let domain = match conn.domain.trim() {
             "" => group
                 .map(|g| g.domain.trim().to_string())
@@ -373,7 +501,11 @@ impl Config {
         };
         Resolved {
             conn: conn.clone(),
+            username,
             domain,
+            password_key,
+            creds_from_group: creds_group.map(|g| g.name.clone()),
+            scale: conn.scaling.percent(),
             cert: conn
                 .cert
                 .or(group.and_then(|g| g.cert))
@@ -494,6 +626,83 @@ mod tests {
                 .unwrap()
                 .contains("gateway_enabled")
         );
+    }
+
+    #[test]
+    fn group_credentials_apply_without_own_username() {
+        let config = Config {
+            groups: vec![Group {
+                name: "Work".into(),
+                username: "svc".into(),
+                has_saved_password: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let member = Connection {
+            group: "Work".into(),
+            host: "pc1".into(),
+            has_saved_password: true,
+            ..Default::default()
+        };
+        let r = config.resolve(&member);
+        assert_eq!(r.username, "svc");
+        assert_eq!(r.password_key, Some(Key::GroupRdp("Work".into())));
+        assert_eq!(r.creds_from_group.as_deref(), Some("Work"));
+
+        // Its own username means its own password.
+        let own = Connection {
+            username: "alice".into(),
+            ..member.clone()
+        };
+        let r = config.resolve(&own);
+        assert_eq!(r.username, "alice");
+        assert_eq!(r.password_key, Some(Key::Rdp(own.id)));
+        assert_eq!(r.creds_from_group, None);
+
+        // A group without credentials changes nothing.
+        let plain = Config {
+            groups: vec![Group {
+                name: "Work".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let r = plain.resolve(&member);
+        assert_eq!((r.username.as_str(), r.creds_from_group), ("", None));
+        assert_eq!(r.password_key, Some(Key::Rdp(member.id)));
+    }
+
+    #[test]
+    fn tags_and_search() {
+        assert_eq!(parse_tags(" web, #prod,, Web ,db"), ["web", "prod", "db"]);
+        let c = Connection {
+            name: "Mail".into(),
+            host: "mx1".into(),
+            tags: vec!["Exchange".into()],
+            notes: "Owned by the messaging team".into(),
+            ..Default::default()
+        };
+        assert!(c.matches("mail"));
+        assert!(c.matches("exch"));
+        assert!(c.matches("messaging"));
+        assert!(c.matches("#exchange"));
+        assert!(!c.matches("#exch"));
+        assert!(!c.matches("web"));
+    }
+
+    #[test]
+    fn scaling_round_trips_through_toml() {
+        for scaling in [Scaling::Off, Scaling::Auto, Scaling::Percent(150)] {
+            let c = Connection {
+                scaling,
+                ..Default::default()
+            };
+            let back: Connection = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back.scaling, scaling);
+        }
+        assert_eq!(Scaling::Percent(175).percent(), Some(175));
+        assert_eq!(Scaling::Off.percent(), None);
     }
 
     #[test]

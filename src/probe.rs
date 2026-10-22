@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui;
+use crate::bus::Bus;
 use uuid::Uuid;
 
 const INTERVAL: Duration = Duration::from_secs(30);
@@ -33,7 +33,7 @@ pub struct Prober {
 }
 
 impl Prober {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(bus: Bus) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<Target>>();
         let results: Arc<Mutex<HashMap<Uuid, (Target, Reach)>>> = Arc::default();
         let shared = results.clone();
@@ -62,7 +62,7 @@ impl Prober {
                         shared.lock().unwrap().insert(t.id, (t, reach));
                     }
                 }
-                ctx.request_repaint();
+                bus.wake();
             }
         });
         Self {
@@ -115,8 +115,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(matches!(check("127.0.0.1", port), Reach::Up(_)));
-        drop(listener);
-        assert!(matches!(check("127.0.0.1", port), Reach::Down(_)));
+        // Not the freed port: a parallel test may grab it. Port 1 needs root to listen on.
+        assert!(matches!(check("127.0.0.1", 1), Reach::Down(_)));
         assert!(matches!(check("nonexistent.invalid", 3389), Reach::Down(_)));
     }
 }

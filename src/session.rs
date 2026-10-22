@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use eframe::egui;
 use uuid::Uuid;
 
+use crate::bus::Bus;
 use crate::command;
 use crate::diagnose::{self, Diagnosis, Severity};
 
@@ -54,7 +54,7 @@ impl Session {
         args: &[String],
         connection_id: Uuid,
         name: String,
-        ctx: &egui::Context,
+        bus: &Bus,
     ) -> Result<Self> {
         let mut child = Command::new(client)
             .arg("/args-from:stdin")
@@ -80,8 +80,8 @@ impl Session {
         let output = Arc::new(Mutex::new(Output::default()));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        pump(stdout, output.clone(), ctx.clone());
-        pump(stderr, output.clone(), ctx.clone());
+        pump(stdout, output.clone(), bus.clone());
+        pump(stderr, output.clone(), bus.clone());
 
         Ok(Self {
             connection_id,
@@ -192,7 +192,7 @@ impl Drop for Session {
     }
 }
 
-fn pump(stream: impl Read + Send + 'static, output: Arc<Mutex<Output>>, ctx: egui::Context) {
+fn pump(stream: impl Read + Send + 'static, output: Arc<Mutex<Output>>, bus: Bus) {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { break };
@@ -205,7 +205,7 @@ fn pump(stream: impl Read + Send + 'static, output: Arc<Mutex<Output>>, ctx: egu
             }
             out.lines.push(line);
             drop(out);
-            ctx.request_repaint();
+            bus.wake();
         }
     });
 }
@@ -236,13 +236,13 @@ mod tests {
         let args: Vec<String> = ["/v:host", "/u:alice", "/p:hunter2"]
             .map(String::from)
             .into();
-        let ctx = egui::Context::default();
+        let bus = Bus::default();
         let mut s = Session::spawn(
             client.to_str().unwrap(),
             &args,
             Uuid::new_v4(),
             "Lab".into(),
-            &ctx,
+            &bus,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,24 +8,33 @@ use eframe::egui::{self, Color32, Key as KeyCode, KeyboardShortcut, Modifiers, R
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bus::{Bus, Command};
+use crate::certs::{self, KnownCert};
 use crate::command::{self, Credentials};
+use crate::desktop;
 use crate::diagnose::{Fix, Severity};
 use crate::model::{
-    self, CertPolicy, Config, Connection, GatewayMode, Group, Profile, Resolved, Settings,
+    self, CertPolicy, Config, Connection, GatewayMode, Group, Profile, Resolved, Scaling, Settings,
 };
 use crate::notify;
 use crate::probe::{Prober, Reach, Target};
 use crate::secrets::{self, Key};
 use crate::session::{Session, Status};
 use crate::single_instance::Primary;
+use crate::tray::{self, Tray};
 
 /// eframe storage key for the last selected item.
 const SELECTION_KEY: &str = "selection";
 const SEARCH_ID: &str = "connection_search";
+const QUICK_ID: &str = "quick_connect";
+/// How many recently used connections the sidebar and tray show.
+const RECENT_COUNT: usize = 5;
 
 const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::N);
 const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::S);
 const SHORTCUT_FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::F);
+const SHORTCUT_QUICK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::L);
+const SHORTCUT_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, KeyCode::Q);
 
 /// What was selected in the sidebar, restored on the next start.
 #[derive(Serialize, Deserialize)]
@@ -59,12 +68,15 @@ struct Draft {
     conn: Connection,
     password: String,
     gateway_password: String,
+    /// The tags as typed; parsed into `conn.tags` as you type.
+    tags_text: String,
     is_new: bool,
 }
 
 impl Draft {
     fn new(conn: Connection, is_new: bool) -> Self {
         Self {
+            tags_text: conn.tags.join(", "),
             conn,
             password: String::new(),
             gateway_password: String::new(),
@@ -78,6 +90,7 @@ struct GroupDraft {
     group: Group,
     /// The group as currently saved (or an empty one if it has no saved defaults).
     original: Group,
+    password: String,
     gateway_password: String,
 }
 
@@ -90,16 +103,37 @@ impl GroupDraft {
         Self {
             group: original.clone(),
             original,
+            password: String::new(),
             gateway_password: String::new(),
         }
     }
 }
 
 struct PasswordPrompt {
-    id: Uuid,
+    /// A copy, so quick connections (which aren't saved) work too.
+    conn: Connection,
     target: String,
     password: String,
+    /// Where "Save in keyring" stores the password and what to call it; `None` for
+    /// quick connections.
+    save_to: Option<(Key, String)>,
     remember: bool,
+}
+
+/// What happens when the window closes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Exit {
+    Quit,
+    /// Keep running in the tray.
+    Hide,
+    /// Close and immediately reopen, so the new window can take focus with `token`.
+    Reopen(Option<String>),
+}
+
+/// What `main` should do after the window has closed.
+pub enum Next {
+    Show(Option<String>),
+    Quit,
 }
 
 enum Action {
@@ -114,8 +148,15 @@ enum Action {
     Delete(Uuid),
     ClearGroup,
     Forget(Key),
+    /// Forgets whichever password the connection uses (its own or its group's).
+    ForgetPassword(Uuid),
     ForgetCertificate(Uuid),
+    ToggleFavorite(Uuid),
     Connect(Uuid),
+    QuickConnect,
+    OpenCertificates,
+    ForgetKnownCert(PathBuf),
+    AskQuit,
     Launch,
     Stop(usize),
     Dismiss(usize),
@@ -144,22 +185,47 @@ pub struct App {
     actions: Vec<Action>,
     /// Keeps the single-instance lock for as long as the app runs.
     _instance: Option<Primary>,
-    /// Set when another launch asked this window to come to the front.
-    show_requested: Option<Arc<AtomicBool>>,
+    /// Commands from the tray and other launches, and wake-ups from background threads.
+    bus: Bus,
     /// Notices from background work (e.g. saving a log file).
     inbox: Arc<Mutex<Vec<(String, bool)>>>,
+    /// Text of the quick-connect box.
+    quick: String,
+    /// Quick connections made this run; not saved.
+    adhoc: Vec<Connection>,
+    /// The certificate manager's list, while it is open.
+    known_certs: Option<Vec<KnownCert>>,
+    /// Whether to touch the desktop: tray icon and launcher actions (off in tests).
+    integrations: bool,
+    tray: Option<Tray>,
+    /// Favourites last written to the launcher actions.
+    launcher_favourites: Option<Vec<(Uuid, String)>>,
+    told_about_tray: bool,
+    exit: Exit,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, instance: Option<Primary>) -> Self {
+    /// The real app: with the tray icon, launcher actions and `request` from the command
+    /// line (e.g. `--connect`).
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        instance: Option<Primary>,
+        request: Command,
+    ) -> Self {
         let path = Config::path().unwrap_or_else(|_| "xrdp-gui.toml".into());
-        Self::with_config_path(cc, instance, path)
+        let mut app = Self::with_config_path(cc, instance, path);
+        app.integrations = true;
+        app.sync_tray_setting();
+        if let Command::Connect { .. } = request {
+            app.bus.send(request);
+        }
+        app
     }
 
     fn with_config_path(
         cc: &eframe::CreationContext<'_>,
         instance: Option<Primary>,
-        config_path: std::path::PathBuf,
+        config_path: PathBuf,
     ) -> Self {
         let (config, load_error) = match Config::load(&config_path) {
             Ok(c) => (c, None),
@@ -168,11 +234,13 @@ impl App {
         let mut notice = load_error
             .as_ref()
             .map(|e| (format!("Config not loaded, saving disabled: {e}"), true));
-        let show_requested = instance.as_ref().and_then(|p| {
-            p.listen(cc.egui_ctx.clone())
-                .inspect_err(|e| notice = Some((format!("{e:#}"), true)))
-                .ok()
-        });
+        let bus = Bus::default();
+        bus.set_ctx(Some(cc.egui_ctx.clone()));
+        if let Some(p) = &instance
+            && let Err(e) = p.listen(bus.clone())
+        {
+            notice = Some((format!("{e:#}"), true));
+        }
         let mut app = Self {
             config,
             config_path,
@@ -188,11 +256,19 @@ impl App {
             confirm_quit: false,
             allow_close: false,
             notice,
-            prober: Prober::new(cc.egui_ctx.clone()),
+            prober: Prober::new(bus.clone()),
             actions: Vec::new(),
             _instance: instance,
-            show_requested,
+            bus,
             inbox: Arc::default(),
+            quick: String::new(),
+            adhoc: Vec::new(),
+            known_certs: None,
+            integrations: false,
+            tray: None,
+            launcher_favourites: None,
+            told_about_tray: false,
+            exit: Exit::Quit,
         };
         match cc.storage.and_then(|s| eframe::get_value(s, SELECTION_KEY)) {
             Some(Selection::Connection(id)) => {
@@ -204,6 +280,154 @@ impl App {
             _ => {}
         }
         app
+    }
+
+    /// Hooks the app up to a newly opened window.
+    pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) {
+        self.bus.set_ctx(Some(cc.egui_ctx.clone()));
+        self.exit = Exit::Quit;
+        self.allow_close = false;
+    }
+
+    /// Runs while the window is closed (in the tray), until it should open again or
+    /// the app should quit.
+    pub fn run_hidden(&mut self) -> Next {
+        self.bus.set_ctx(None);
+        match std::mem::replace(&mut self.exit, Exit::Quit) {
+            Exit::Quit => return Next::Quit,
+            Exit::Reopen(token) => return Next::Show(token),
+            Exit::Hide => {}
+        }
+        loop {
+            self.bus.wait(Duration::from_millis(500));
+            self.poll_sessions();
+            self.sync_integrations();
+            for cmd in self.bus.take() {
+                match cmd {
+                    Command::Show { token } => return Next::Show(token),
+                    Command::Connect { target, token } => {
+                        self.connect_target(&target);
+                        // A password prompt or an error needs the window.
+                        if self.prompt.is_some() || self.notice.as_ref().is_some_and(|n| n.1) {
+                            return Next::Show(token);
+                        }
+                    }
+                    Command::Quit => {
+                        self.terminate_all();
+                        return Next::Quit;
+                    }
+                }
+            }
+        }
+    }
+
+    fn terminate_all(&mut self) {
+        for s in &mut self.sessions {
+            s.terminate();
+        }
+    }
+
+    /// Starts or stops the tray icon to match the settings.
+    fn sync_tray_setting(&mut self) {
+        if !self.integrations {
+            return;
+        }
+        match (self.config.settings.tray, self.tray.is_some()) {
+            (true, false) => match Tray::spawn(self.bus.clone()) {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => self.error(e),
+            },
+            (false, true) => self.tray = None,
+            _ => {}
+        }
+    }
+
+    fn tray_active(&self) -> bool {
+        self.tray.as_ref().is_some_and(Tray::is_alive)
+    }
+
+    /// Favourites first, then the most recently used connections (excluding favourites).
+    fn favourites_and_recent(&self) -> (Vec<&Connection>, Vec<&Connection>) {
+        let mut favourites: Vec<&Connection> = self
+            .config
+            .connections
+            .iter()
+            .filter(|c| c.favorite)
+            .collect();
+        favourites.sort_by_key(|c| c.display_name().to_lowercase());
+        let mut recent: Vec<&Connection> = self
+            .config
+            .connections
+            .iter()
+            .filter(|c| c.last_used.is_some() && !c.favorite)
+            .collect();
+        recent.sort_by_key(|c| std::cmp::Reverse(c.last_used));
+        recent.truncate(RECENT_COUNT);
+        (favourites, recent)
+    }
+
+    /// Keeps the tray menu and the launcher's favourite actions up to date.
+    fn sync_integrations(&mut self) {
+        if !self.integrations {
+            return;
+        }
+        let (favourites, recent) = self.favourites_and_recent();
+        let entry = |c: &&Connection| tray::Entry {
+            id: c.id,
+            name: c.display_name().to_string(),
+            running: self
+                .sessions
+                .iter()
+                .any(|s| s.connection_id == c.id && s.is_running()),
+        };
+        let menu = tray::Menu {
+            favourites: favourites.iter().map(entry).collect(),
+            recent: recent.iter().map(entry).collect(),
+            running: self.sessions.iter().filter(|s| s.is_running()).count(),
+        };
+        let launcher: Vec<(Uuid, String)> = favourites
+            .iter()
+            .map(|c| (c.id, c.display_name().to_string()))
+            .collect();
+        if let Some(t) = &mut self.tray {
+            t.set_menu(menu);
+        }
+        if self.launcher_favourites.as_ref() != Some(&launcher) {
+            desktop::update_favourites(launcher.clone());
+            self.launcher_favourites = Some(launcher);
+        }
+    }
+
+    /// Handles commands from the tray and other launches while the window is open.
+    fn handle_commands(&mut self, ctx: &egui::Context) {
+        for cmd in self.bus.take() {
+            match cmd {
+                Command::Show { token } => self.bring_to_front(ctx, token),
+                Command::Connect { target, token } => {
+                    self.connect_target(&target);
+                    if self.prompt.is_some() {
+                        self.bring_to_front(ctx, token);
+                    }
+                }
+                Command::Quit => self.actions.push(Action::AskQuit),
+            }
+        }
+    }
+
+    fn bring_to_front(&mut self, ctx: &egui::Context, token: Option<String>) {
+        // Wayland doesn't let a window raise itself, but a new window may take focus
+        // with an activation token, so close and reopen.
+        if token.is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            self.exit = Exit::Reopen(token);
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
     }
 
     fn selection(&self) -> Option<Selection> {
@@ -224,13 +448,21 @@ impl App {
         if modal_open {
             return;
         }
-        let (new, save, find) = ctx.input_mut(|i| {
+        let (new, save, find, quick, quit) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&SHORTCUT_NEW),
                 i.consume_shortcut(&SHORTCUT_SAVE),
                 i.consume_shortcut(&SHORTCUT_FIND),
+                i.consume_shortcut(&SHORTCUT_QUICK),
+                i.consume_shortcut(&SHORTCUT_QUIT),
             )
         });
+        if quick {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::unique(QUICK_ID)));
+        }
+        if quit {
+            self.actions.push(Action::AskQuit);
+        }
         if new {
             self.actions.push(Action::NewConnection);
         }
@@ -313,7 +545,13 @@ impl App {
     // ---- state helpers -------------------------------------------------------------
 
     fn find(&self, id: Uuid) -> Option<&Connection> {
-        self.config.connections.iter().find(|c| c.id == id)
+        self.config.find(id)
+    }
+
+    /// A saved connection or a quick connection from this run.
+    fn find_any(&self, id: Uuid) -> Option<&Connection> {
+        self.find(id)
+            .or_else(|| self.adhoc.iter().find(|c| c.id == id))
     }
 
     fn conn_dirty(&self) -> bool {
@@ -326,9 +564,9 @@ impl App {
     }
 
     fn group_dirty(&self) -> bool {
-        self.group_draft
-            .as_ref()
-            .is_some_and(|g| g.group != g.original || !g.gateway_password.is_empty())
+        self.group_draft.as_ref().is_some_and(|g| {
+            g.group != g.original || !g.password.is_empty() || !g.gateway_password.is_empty()
+        })
     }
 
     fn info(&mut self, msg: impl Into<String>) {
@@ -399,12 +637,26 @@ impl App {
 
         // A brand-new group has no old name; don't sweep ungrouped connections into it.
         if new_name != old_name && !old_name.is_empty() {
-            if g.original.has_saved_gateway_password && g.gateway_password.is_empty() {
-                let old_key = Key::GroupGateway(old_name.clone());
-                if let Some(pw) = secrets::get(&old_key)? {
-                    secrets::set(&Key::GroupGateway(new_name.clone()), &pw)?;
+            // Saved passwords are keyed by group name; move them along.
+            let moves = [
+                (
+                    g.original.has_saved_password && g.password.is_empty(),
+                    Key::GroupRdp(old_name.clone()),
+                    Key::GroupRdp(new_name.clone()),
+                ),
+                (
+                    g.original.has_saved_gateway_password && g.gateway_password.is_empty(),
+                    Key::GroupGateway(old_name.clone()),
+                    Key::GroupGateway(new_name.clone()),
+                ),
+            ];
+            for (needed, old_key, new_key) in moves {
+                if needed {
+                    if let Some(pw) = secrets::get(&old_key)? {
+                        secrets::set(&new_key, &pw)?;
+                    }
+                    secrets::delete(&old_key)?;
                 }
-                secrets::delete(&old_key)?;
             }
             for c in self
                 .config
@@ -421,6 +673,11 @@ impl App {
             {
                 d.conn.group = new_name.clone();
             }
+        }
+        if !g.password.is_empty() {
+            secrets::set(&Key::GroupRdp(new_name.clone()), &g.password)?;
+            g.group.has_saved_password = true;
+            g.password.clear();
         }
         if !g.gateway_password.is_empty() {
             secrets::set(&Key::GroupGateway(new_name.clone()), &g.gateway_password)?;
@@ -535,6 +792,7 @@ impl App {
                 }
                 if let Some(g) = &mut self.group_draft {
                     g.group = g.original.clone();
+                    g.password.clear();
                     g.gateway_password.clear();
                 }
             }
@@ -548,6 +806,8 @@ impl App {
                         name: format!("{} (copy)", src.display_name()),
                         has_saved_password: false,
                         has_saved_gateway_password: false,
+                        favorite: false,
+                        last_used: None,
                         ..src.clone()
                     };
                     self.group_draft = None;
@@ -576,6 +836,7 @@ impl App {
                 self.config.groups.retain(|x| x.name != name);
                 *g = GroupDraft::new(&self.config, &name);
                 let result = secrets::delete(&Key::GroupGateway(name.clone()))
+                    .and_then(|()| secrets::delete(&Key::GroupRdp(name.clone())))
                     .and_then(|()| self.save_config());
                 match result {
                     Ok(()) => self.info(format!("Cleared the defaults of “{name}”")),
@@ -586,12 +847,62 @@ impl App {
                 Ok(()) => self.info("Password removed from keyring"),
                 Err(e) => self.error(e),
             },
+            Action::ForgetPassword(id) => {
+                let key = self
+                    .find(id)
+                    .map(|c| self.config.resolve(c))
+                    .and_then(|r| r.password_key);
+                if let Some(key) = key {
+                    self.actions.push(Action::Forget(key));
+                }
+            }
             Action::ForgetCertificate(id) => match self.forget_certificate(id) {
                 Ok(msg) => self.info(msg),
                 Err(e) => self.error(e),
             },
-            Action::Connect(id) => self.connect(id, ctx),
-            Action::Launch => self.launch_from_prompt(ctx),
+            Action::ToggleFavorite(id) => {
+                let drafts = self
+                    .draft
+                    .as_mut()
+                    .map(|d| &mut d.conn)
+                    .filter(|c| c.id == id);
+                for c in self
+                    .config
+                    .connections
+                    .iter_mut()
+                    .filter(|c| c.id == id)
+                    .chain(drafts)
+                {
+                    c.favorite = !c.favorite;
+                }
+                if let Err(e) = self.save_config() {
+                    self.error(e);
+                }
+            }
+            Action::Connect(id) => self.connect(id),
+            Action::QuickConnect => {
+                let target = std::mem::take(&mut self.quick);
+                self.connect_target(&target);
+            }
+            Action::Launch => self.launch_from_prompt(),
+            Action::OpenCertificates => self.known_certs = Some(self.load_certs()),
+            Action::ForgetKnownCert(path) => {
+                match certs::forget(&path) {
+                    Ok(()) => self.info(format!("Forgot {}", path.display())),
+                    Err(e) => self.error(e),
+                }
+                if self.known_certs.is_some() {
+                    self.known_certs = Some(self.load_certs());
+                }
+            }
+            Action::AskQuit => {
+                if self.sessions.iter().any(Session::is_running) {
+                    self.confirm_quit = true;
+                    self.bring_to_front(ctx, None);
+                } else {
+                    self.actions.push(Action::Quit);
+                }
+            }
             Action::Stop(i) => {
                 if let Some(s) = self.sessions.get_mut(i) {
                     s.terminate();
@@ -622,12 +933,12 @@ impl App {
                     if let Err(e) = self.save_config() {
                         self.error(e);
                     }
+                    self.sync_tray_setting();
                 }
             }
             Action::Quit => {
-                for s in &mut self.sessions {
-                    s.terminate();
-                }
+                self.terminate_all();
+                self.exit = Exit::Quit;
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -658,6 +969,19 @@ impl App {
                     }
                 }
             }
+            Key::GroupRdp(name) => {
+                for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
+                    g.has_saved_password = false;
+                }
+                if let Some(g) = self
+                    .group_draft
+                    .as_mut()
+                    .filter(|g| g.original.name == *name)
+                {
+                    g.group.has_saved_password = false;
+                    g.original.has_saved_password = false;
+                }
+            }
             Key::GroupGateway(name) => {
                 for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
                     g.has_saved_gateway_password = false;
@@ -678,13 +1002,8 @@ impl App {
     /// Removes FreeRDP's trust-on-first-use record for a host so a changed certificate
     /// can be accepted again.
     fn forget_certificate(&self, id: Uuid) -> Result<String> {
-        let conn = self.find(id).context("connection no longer exists")?;
-        let dirs = directories::BaseDirs::new().context("could not determine config directory")?;
-        let file = dirs.config_dir().join("freerdp/server").join(format!(
-            "{}_{}.pem",
-            conn.host.trim().to_lowercase(),
-            conn.port
-        ));
+        let conn = self.find_any(id).context("connection no longer exists")?;
+        let file = certs::path_for(&conn.host, conn.port)?;
         match std::fs::remove_file(&file) {
             Ok(()) => Ok(format!(
                 "Forgot the saved certificate for {}. Connect again to review and trust the new one.",
@@ -697,56 +1016,118 @@ impl App {
         }
     }
 
-    fn connect(&mut self, id: Uuid, ctx: &egui::Context) {
+    fn load_certs(&mut self) -> Vec<KnownCert> {
+        certs::list().unwrap_or_else(|e| {
+            self.error(e);
+            Vec::new()
+        })
+    }
+
+    /// Connects to a saved connection given by id, name or host; anything else is
+    /// treated as a quick connection to that host.
+    fn connect_target(&mut self, target: &str) {
+        let t = target.trim();
+        let found = self
+            .config
+            .connections
+            .iter()
+            .find(|c| c.id.to_string() == t)
+            .or_else(|| {
+                let lower = t.to_lowercase();
+                let by = |f: fn(&Connection) -> &str| {
+                    self.config
+                        .connections
+                        .iter()
+                        .find(|c| f(c).trim().to_lowercase() == lower)
+                };
+                by(|c| c.display_name()).or_else(|| by(|c| &c.host))
+            })
+            .map(|c| c.id);
+        match found {
+            Some(id) => self.connect(id),
+            None => self.quick_connect(t),
+        }
+    }
+
+    /// Connects to `[DOMAIN\]user@host[:port]` without saving a connection.
+    fn quick_connect(&mut self, target: &str) {
+        let Some(conn) = parse_quick(target) else {
+            self.error(anyhow::anyhow!("enter a host name to connect to"));
+            return;
+        };
+        // Reuse an earlier quick connection to the same place so reconnecting matches.
+        let id = match self.adhoc.iter().find(|c| {
+            (
+                c.host.as_str(),
+                c.port,
+                c.username.as_str(),
+                c.domain.as_str(),
+            ) == (
+                conn.host.as_str(),
+                conn.port,
+                conn.username.as_str(),
+                conn.domain.as_str(),
+            )
+        }) {
+            Some(c) => c.id,
+            None => {
+                let id = conn.id;
+                self.adhoc.push(conn);
+                id
+            }
+        };
+        self.connect(id);
+    }
+
+    fn connect(&mut self, id: Uuid) {
         if self.draft.as_ref().is_some_and(|d| d.conn.id == id) && !self.commit() {
             return;
         }
-        let Some(conn) = self.find(id).cloned() else {
+        let Some(conn) = self.find_any(id).cloned() else {
             return;
         };
+        let saved_conn = self.find(id).is_some();
+        let resolved = self.config.resolve(&conn);
 
-        let saved = if conn.has_saved_password {
-            secrets::get(&Key::Rdp(id)).unwrap_or_else(|e| {
+        let saved = resolved.password_key.as_ref().and_then(|key| {
+            secrets::get(key).unwrap_or_else(|e| {
                 self.error(e);
                 None
             })
-        } else {
-            None
-        };
+        });
         match saved {
-            Some(password) => self.launch(&conn, Some(password), ctx),
+            Some(password) => self.launch(&conn, Some(password)),
             None => {
-                let domain = self.config.resolve(&conn).domain;
-                let user = match (domain.as_str(), conn.username.trim()) {
+                let user = match (resolved.domain.as_str(), resolved.username.as_str()) {
                     (_, "") => String::new(),
                     ("", u) => format!("{u}@"),
                     (d, u) => format!("{d}\\{u}@"),
                 };
+                let save_to = match &resolved.creds_from_group {
+                    Some(g) => Some((
+                        Key::GroupRdp(g.clone()),
+                        format!("Save in keyring for group “{g}”"),
+                    )),
+                    None if saved_conn => Some((Key::Rdp(id), "Save in keyring".to_string())),
+                    None => None,
+                };
                 self.prompt = Some(PasswordPrompt {
-                    id,
                     target: format!("{user}{}", conn.host.trim()),
+                    conn,
                     password: String::new(),
+                    save_to,
                     remember: false,
                 });
             }
         }
     }
 
-    fn launch_from_prompt(&mut self, ctx: &egui::Context) {
+    fn launch_from_prompt(&mut self) {
         let Some(p) = self.prompt.take() else { return };
-        let Some(mut conn) = self.find(p.id).cloned() else {
-            return;
-        };
-        if p.remember && !p.password.is_empty() {
-            match secrets::set(&Key::Rdp(p.id), &p.password) {
+        if let Some((key, _)) = p.save_to.filter(|_| p.remember && !p.password.is_empty()) {
+            match secrets::set(&key, &p.password) {
                 Ok(()) => {
-                    conn.has_saved_password = true;
-                    for c in self.config.connections.iter_mut().filter(|c| c.id == p.id) {
-                        c.has_saved_password = true;
-                    }
-                    if let Some(d) = self.draft.as_mut().filter(|d| d.conn.id == p.id) {
-                        d.conn.has_saved_password = true;
-                    }
+                    self.mark_saved(&key);
                     if let Err(e) = self.save_config() {
                         self.error(e);
                     }
@@ -756,10 +1137,47 @@ impl App {
         }
         // An empty password lets FreeRDP prompt (or use Kerberos/smartcard) itself.
         let password = Some(p.password).filter(|p| !p.is_empty());
-        self.launch(&conn, password, ctx);
+        let conn = self.find_any(p.conn.id).cloned().unwrap_or(p.conn);
+        self.launch(&conn, password);
     }
 
-    fn launch(&mut self, conn: &Connection, password: Option<String>, ctx: &egui::Context) {
+    /// Records that a password is now in the keyring under `key`.
+    fn mark_saved(&mut self, key: &Key) {
+        match key {
+            Key::Rdp(id) => {
+                let drafts = self
+                    .draft
+                    .as_mut()
+                    .map(|d| &mut d.conn)
+                    .filter(|c| c.id == *id);
+                for c in self
+                    .config
+                    .connections
+                    .iter_mut()
+                    .filter(|c| c.id == *id)
+                    .chain(drafts)
+                {
+                    c.has_saved_password = true;
+                }
+            }
+            Key::GroupRdp(name) => {
+                for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
+                    g.has_saved_password = true;
+                }
+                if let Some(g) = self
+                    .group_draft
+                    .as_mut()
+                    .filter(|g| g.original.name == *name)
+                {
+                    g.group.has_saved_password = true;
+                    g.original.has_saved_password = true;
+                }
+            }
+            Key::Gateway(_) | Key::GroupGateway(_) => {}
+        }
+    }
+
+    fn launch(&mut self, conn: &Connection, password: Option<String>) {
         let resolved = self.config.resolve(conn);
         let gateway_password = match &resolved.gateway {
             Some(gw) if !gw.same_credentials => gw.saved_password.as_ref().and_then(|key| {
@@ -781,15 +1199,40 @@ impl App {
                 &args,
                 conn.id,
                 conn.display_name().to_string(),
-                ctx,
+                &self.bus,
             )
         });
         match result {
             Ok(session) => {
                 self.sessions.push(session);
                 self.info(format!("Connecting to {}…", conn.display_name()));
+                self.touch(conn.id);
             }
             Err(e) => self.error(e),
+        }
+    }
+
+    /// Marks a saved connection as just used.
+    fn touch(&mut self, id: Uuid) {
+        let now = chrono::Local::now().timestamp();
+        let drafts = self
+            .draft
+            .as_mut()
+            .map(|d| &mut d.conn)
+            .filter(|c| c.id == id);
+        let mut found = false;
+        for c in self
+            .config
+            .connections
+            .iter_mut()
+            .filter(|c| c.id == id)
+            .chain(drafts)
+        {
+            c.last_used = Some(now);
+            found = true;
+        }
+        if found && let Err(e) = self.save_config() {
+            self.error(e);
         }
     }
 
@@ -891,9 +1334,35 @@ impl App {
             {
                 self.actions.push(Action::NewGroup);
             }
+            ui.separator();
+            let quick = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.quick)
+                        .id(egui::Id::unique(QUICK_ID))
+                        .hint_text("Quick connect: [user@]host[:port]")
+                        .desired_width(230.0),
+                )
+                .accessible_name("Quick connect")
+                .on_hover_text(
+                    "Connect without saving a connection (Ctrl+L). \
+                     Also accepts the name of a saved connection.",
+                );
+            if quick.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !self.quick.trim().is_empty()
+            {
+                self.actions.push(Action::QuickConnect);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙ Settings").clicked() {
                     self.settings_draft = Some(self.config.settings.clone());
+                }
+                if ui
+                    .button("🔒 Certificates")
+                    .on_hover_text("Server certificates FreeRDP trusts")
+                    .clicked()
+                {
+                    self.actions.push(Action::OpenCertificates);
                 }
                 if let Some((msg, is_err)) = &self.notice {
                     let color = if *is_err {
@@ -915,79 +1384,153 @@ impl App {
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
                 .id(egui::Id::unique(SEARCH_ID))
-                .hint_text("🔍 Search (Ctrl+F)")
+                .hint_text("🔍 Search (Ctrl+F), #tag")
                 .desired_width(f32::INFINITY),
         )
         .accessible_name("Search connections");
         ui.add_space(4.0);
 
         let query = self.search.trim().to_lowercase();
-        let mut groups: BTreeMap<String, Vec<&Connection>> = BTreeMap::new();
-        if query.is_empty() {
+        let searching = !query.is_empty();
+        let mut groups: BTreeMap<String, Vec<Uuid>> = BTreeMap::new();
+        if !searching {
             // Show groups that only have defaults so they can be edited.
             for g in &self.config.groups {
                 groups.entry(g.name.clone()).or_default();
             }
         }
-        for c in &self.config.connections {
-            let hit = query.is_empty()
-                || [&c.name, &c.host, &c.username, &c.group]
-                    .iter()
-                    .any(|f| f.to_lowercase().contains(&query));
-            if hit {
-                groups
-                    .entry(c.group.trim().to_string())
-                    .or_default()
-                    .push(c);
-            }
+        let mut sorted: Vec<&Connection> = self.config.connections.iter().collect();
+        sorted.sort_by_key(|c| c.display_name().to_lowercase());
+        for c in sorted.into_iter().filter(|c| c.matches(&query)) {
+            groups
+                .entry(c.group.trim().to_string())
+                .or_default()
+                .push(c.id);
         }
+        let ids = |list: Vec<&Connection>| list.iter().map(|c| c.id).collect::<Vec<_>>();
+        let (favourites, recent) = self.favourites_and_recent();
+        let (favourites, recent) = (ids(favourites), ids(recent));
 
         let selected = self.draft.as_ref().map(|d| d.conn.id);
-        let selected_group = self.group_draft.as_ref().map(|g| g.original.name.as_str());
+        let selected_group = self.group_draft.as_ref().map(|g| g.original.name.clone());
+        let accordion = self.config.settings.accordion && !searching;
+        let config = &self.config;
+        let sessions = &self.sessions;
+        let prober = &self.prober;
+        let actions = &mut self.actions;
+        let rows = |ui: &mut egui::Ui, list: &[Uuid], actions: &mut Vec<Action>| {
+            for c in list.iter().filter_map(|id| config.find(*id)) {
+                connection_row(
+                    ui,
+                    c,
+                    selected == Some(c.id),
+                    config,
+                    sessions,
+                    prober,
+                    actions,
+                );
+            }
+        };
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.config.connections.is_empty() {
+            if config.connections.is_empty() {
                 ui.weak("No connections yet.");
             }
-            let show_headers = groups.len() > 1 || groups.keys().any(|g| !g.is_empty());
-            for (group, mut conns) in groups {
-                if show_headers {
-                    ui.add_space(6.0);
-                    if group.is_empty() {
-                        ui.label(RichText::new("Ungrouped").small().strong());
-                    } else {
-                        let has_defaults = self.config.group(&group).is_some();
-                        let label = RichText::new(if has_defaults {
-                            format!("{group}  ⚙")
-                        } else {
-                            group.clone()
-                        })
-                        .small()
-                        .strong();
-                        let resp = ui
-                            .add(egui::Button::selectable(
-                                selected_group == Some(group.as_str()),
-                                label,
-                            ))
-                            .on_hover_text("Click to edit this group's shared defaults");
-                        if resp.clicked() {
-                            self.actions.push(Action::SelectGroup(group.clone()));
-                        }
+            if !searching {
+                for (key, title, list) in [
+                    ("favourites", "★ Favourites", &favourites),
+                    ("recent", "🕘 Recent", &recent),
+                ] {
+                    if list.is_empty() {
+                        continue;
                     }
+                    let id = ui.make_persistent_id(("sidebar", key));
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        id,
+                        true,
+                    )
+                    .show_header(ui, |ui| ui.label(RichText::new(title).small().strong()))
+                    .body(|ui| rows(ui, list, actions));
                 }
-                if conns.is_empty() {
-                    ui.weak("  (empty)");
+            }
+
+            let show_headers = groups.len() > 1 || groups.keys().any(|g| !g.is_empty());
+            if !show_headers {
+                if let Some(list) = groups.values().next() {
+                    rows(ui, list, actions);
                 }
-                conns.sort_by_key(|c| c.display_name().to_lowercase());
-                for c in conns {
-                    connection_row(
-                        ui,
-                        c,
-                        selected == Some(c.id),
-                        &self.config,
-                        &self.sessions,
-                        &self.prober,
-                        &mut self.actions,
-                    );
+                return;
+            }
+            let mut header_ids = Vec::new();
+            let mut opened = None;
+            for (group, list) in &groups {
+                ui.add_space(2.0);
+                // Searching shows every match without touching the saved open/closed state.
+                let salt = if searching {
+                    "sidebar_search"
+                } else {
+                    "sidebar_group"
+                };
+                let id = ui.make_persistent_id((salt, group));
+                header_ids.push(id);
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    true,
+                );
+                if searching {
+                    state.set_open(true);
+                }
+                let was_open = state.is_open();
+                let (mut toggle, mut edit) = (false, false);
+                let name = if group.is_empty() {
+                    "Ungrouped"
+                } else {
+                    group.as_str()
+                };
+                let mut header = state.show_header(ui, |ui| {
+                    let label = RichText::new(format!("{name} ({})", list.len())).strong();
+                    let is_selected = selected_group.as_deref() == Some(group.as_str());
+                    toggle = ui
+                        .add(egui::Button::selectable(is_selected, label).frame(false))
+                        .on_hover_text("Click to expand or collapse")
+                        .clicked();
+                    if !group.is_empty() {
+                        edit = ui
+                            .small_button("⚙")
+                            .on_hover_text("Edit this group's shared defaults and credentials")
+                            .accessible_name(format!("Edit group {group}"))
+                            .clicked();
+                    }
+                });
+                if toggle {
+                    header.toggle();
+                }
+                if !was_open && header.is_open() {
+                    opened = Some(id);
+                }
+                if edit {
+                    actions.push(Action::SelectGroup(group.clone()));
+                }
+                header.body(|ui| {
+                    if list.is_empty() {
+                        ui.weak("(empty)");
+                    }
+                    rows(ui, list, actions);
+                });
+            }
+            // Accordion: opening one group closes the others.
+            if accordion && let Some(open) = opened {
+                for id in header_ids.into_iter().filter(|id| *id != open) {
+                    let mut state =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            true,
+                        );
+                    state.set_open(false);
+                    state.store(ui.ctx());
                 }
             }
         });
@@ -1004,7 +1547,7 @@ impl App {
             ui.centered_and_justified(|ui| {
                 ui.weak(
                     "Select a connection, or create one with ➕ Connection.\n\
-                     Double-click a connection to connect. Click a group name to edit its defaults.",
+                     Double-click a connection to connect. Click ⚙ next to a group to edit its defaults.",
                 );
             });
             return;
@@ -1019,6 +1562,26 @@ impl App {
         };
 
         ui.horizontal(|ui| {
+            if !d.is_new {
+                let (star, hover) = if d.conn.favorite {
+                    ("★", "Remove from favourites")
+                } else {
+                    (
+                        "☆",
+                        "Add to favourites (shown at the top, in the tray and launcher)",
+                    )
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(star).color(AMBER).size(18.0)).frame(false),
+                    )
+                    .on_hover_text(hover)
+                    .accessible_name("Favourite")
+                    .clicked()
+                {
+                    actions.push(Action::ToggleFavorite(id));
+                }
+            }
             ui.heading(d.conn.display_name().to_owned());
             if dirty {
                 ui.weak("(unsaved)");
@@ -1094,8 +1657,16 @@ impl App {
                     row(ui, "Port", |ui| {
                         ui.add(egui::DragValue::new(&mut c.port).range(1..=65535))
                     });
+                    let group_creds = group
+                        .as_ref()
+                        .filter(|g| !g.username.trim().is_empty() || g.has_saved_password);
                     row(ui, "Username", |ui| {
-                        ui.text_edit_singleline(&mut c.username)
+                        let hint = match group_creds {
+                            Some(g) if g.username.trim().is_empty() => "(from group)".to_string(),
+                            Some(g) => format!("{} (from group)", g.username.trim()),
+                            None => String::new(),
+                        };
+                        ui.add(egui::TextEdit::singleline(&mut c.username).hint_text(hint))
                     });
                     row(ui, "Domain", |ui| {
                         let hint = match group
@@ -1108,15 +1679,27 @@ impl App {
                         };
                         ui.add(egui::TextEdit::singleline(&mut c.domain).hint_text(hint))
                     });
-                    row(ui, "Password", |ui| {
-                        password_field(
-                            ui,
-                            "Password",
-                            &mut d.password,
-                            c.has_saved_password,
-                            || actions.push(Action::Forget(Key::Rdp(id))),
-                        )
-                    });
+                    match group_creds.filter(|_| c.username.trim().is_empty()) {
+                        Some(g) => row(ui, "Password", |ui| {
+                            let text = if g.has_saved_password {
+                                format!("Uses the password saved for group “{}”", g.name)
+                            } else {
+                                format!("Asks when connecting (group “{}”)", g.name)
+                            };
+                            ui.weak(text).on_hover_text(
+                                "Enter a username to use this connection's own credentials",
+                            )
+                        }),
+                        None => row(ui, "Password", |ui| {
+                            password_field(
+                                ui,
+                                "Password",
+                                &mut d.password,
+                                c.has_saved_password,
+                                || actions.push(Action::Forget(Key::Rdp(id))),
+                            )
+                        }),
+                    }
                 });
 
                 section(ui, "Display", true, |ui| {
@@ -1159,6 +1742,24 @@ impl App {
                             &mut c.dynamic_resolution,
                             "Resize remote desktop with the window",
                         )
+                    });
+                    row(ui, "Scaling", |ui| {
+                        let options = [Scaling::Off, Scaling::Auto]
+                            .into_iter()
+                            .chain(Scaling::PRESETS.into_iter().skip(1).map(Scaling::Percent));
+                        egui::ComboBox::from_id_salt("scaling")
+                            .selected_text(c.scaling.label())
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for o in options {
+                                    ui.selectable_value(&mut c.scaling, o, o.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Makes text and icons in the remote desktop larger on \
+                                 high-DPI screens (/scale-desktop)",
+                            )
                     });
                 });
 
@@ -1274,6 +1875,33 @@ impl App {
                     }
                 });
 
+                section(
+                    ui,
+                    "Notes",
+                    !c.notes.is_empty() || !c.tags.is_empty(),
+                    |ui| {
+                        row(ui, "Tags", |ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut d.tags_text)
+                                    .hint_text("comma separated, e.g. prod, sql")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if resp.changed() {
+                                c.tags = model::parse_tags(&d.tags_text);
+                            }
+                            resp
+                        });
+                        row(ui, "Notes", |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut c.notes)
+                                    .hint_text("Who owns it, what it's for… (searchable)")
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        });
+                    },
+                );
+
                 section(ui, "Advanced", false, |ui| {
                     let inherited = group
                         .as_ref()
@@ -1373,9 +2001,6 @@ impl App {
                 let gr = &mut g.group;
                 section(ui, "Defaults", true, |ui| {
                     row(ui, "Name", |ui| ui.text_edit_singleline(&mut gr.name));
-                    row(ui, "Domain", |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut gr.domain).hint_text("e.g. CORP"))
-                    });
                     row(ui, "Profile", |ui| {
                         inherit_combo(
                             ui,
@@ -1394,6 +2019,37 @@ impl App {
                             &CertPolicy::ALL,
                             CertPolicy::label,
                             || format!("Not set ({})", CertPolicy::DEFAULT.label()),
+                        )
+                    });
+                });
+
+                section(ui, "Credentials", true, |ui| {
+                    row(ui, "Username", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut gr.username)
+                                .hint_text("used by members without their own"),
+                        )
+                    });
+                    row(ui, "Domain", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut gr.domain)
+                                .hint_text("e.g. CORP (members without their own)"),
+                        )
+                    });
+                    let key = Key::GroupRdp(g.original.name.clone());
+                    row(ui, "Password", |ui| {
+                        password_field(
+                            ui,
+                            "Group password",
+                            &mut g.password,
+                            gr.has_saved_password,
+                            || actions.push(Action::Forget(key)),
+                        )
+                    });
+                    row(ui, "", |ui| {
+                        ui.weak(
+                            "Members that leave Username empty use this username and password; \
+                             members that leave Domain empty use this domain.",
                         )
                     });
                 });
@@ -1528,7 +2184,7 @@ impl App {
                                     Some(Fix::ForgetPassword) => Some((
                                         "Forget saved password",
                                         "You'll be asked for the password on the next connect",
-                                        Action::Forget(Key::Rdp(s.connection_id)),
+                                        Action::ForgetPassword(s.connection_id),
                                     )),
                                     Some(Fix::ForgetCertificate) => Some((
                                         "Forget saved certificate",
@@ -1606,7 +2262,9 @@ impl App {
                     )
                     .accessible_name("Password");
                 field.request_focus();
-                ui.checkbox(&mut p.remember, "Save in keyring");
+                if let Some((_, label)) = &p.save_to {
+                    ui.checkbox(&mut p.remember, label.as_str());
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     // The field re-takes focus every frame, so it never reports losing it on
@@ -1691,6 +2349,19 @@ impl App {
                         ui.checkbox(&mut s.probe_hosts, "Check whether hosts are reachable");
                         ui.end_row();
                         ui.label("");
+                        ui.label("");
+                        ui.checkbox(
+                            &mut s.tray,
+                            "Tray icon (closing the window keeps xrdp-gui running)",
+                        );
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(
+                            &mut s.accordion,
+                            "Opening a group in the sidebar closes the others",
+                        );
+                        ui.end_row();
+                        ui.label("");
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut s.notifications, "Desktop notifications");
                             if ui.small_button("Test").clicked() {
@@ -1715,6 +2386,127 @@ impl App {
             });
             if close || resp.should_close() {
                 self.settings_draft = None;
+            }
+        }
+
+        if let Some(list) = &self.known_certs {
+            let mut close = false;
+            let resp = egui::Modal::new(egui::Id::unique("certificates")).show(ctx, |ui| {
+                ui.set_width(720.0);
+                ui.heading("Trusted server certificates");
+                ui.label(
+                    "FreeRDP remembers each server's certificate the first time you accept it, and \
+                     refuses to connect if it changes. Forget one when a server's certificate was \
+                     replaced on purpose.",
+                );
+                ui.add_space(6.0);
+                if list.is_empty() {
+                    ui.weak("No certificates saved yet.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("cert_grid")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                for cert in list {
+                                    let used_by: Vec<&str> = self
+                                        .config
+                                        .connections
+                                        .iter()
+                                        .filter(|c| {
+                                            c.host.trim().eq_ignore_ascii_case(&cert.host)
+                                                && c.port == cert.port
+                                        })
+                                        .map(|c| c.display_name())
+                                        .collect();
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("{}:{}", cert.host, cert.port))
+                                                .strong(),
+                                        );
+                                        if !used_by.is_empty() {
+                                            ui.weak(used_by.join(", "));
+                                        }
+                                    });
+                                    match &cert.error {
+                                        Some(e) => {
+                                            ui.colored_label(ui.visuals().warn_fg_color, e);
+                                        }
+                                        None => {
+                                            ui.vertical(|ui| {
+                                                ui.label(format!(
+                                                    "{} (issued by {})",
+                                                    cert.subject, cert.issuer
+                                                ));
+                                                if let Some(t) = cert.expires {
+                                                    let text =
+                                                        format!("Expires {}", t.format("%Y-%m-%d"));
+                                                    if cert.expired() {
+                                                        ui.colored_label(
+                                                            RED,
+                                                            format!("{text} (expired)"),
+                                                        );
+                                                    } else {
+                                                        ui.weak(text);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    let short: String = cert.fingerprint.chars().take(23).collect();
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(format!("{short}…"))
+                                                    .monospace()
+                                                    .small(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(format!(
+                                            "SHA-256 {}\nClick to copy",
+                                            cert.fingerprint
+                                        ))
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(cert.fingerprint.clone());
+                                    }
+                                    if ui
+                                        .button("Forget")
+                                        .on_hover_text(
+                                            "You'll be asked to trust it again on the next connect",
+                                        )
+                                        .accessible_name(format!(
+                                            "Forget certificate for {}",
+                                            cert.host
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.actions
+                                            .push(Action::ForgetKnownCert(cert.path.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.actions.push(Action::OpenCertificates);
+                    }
+                    if ui.button("Open folder").clicked()
+                        && let Ok(dir) = certs::dir()
+                    {
+                        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                    }
+                    close = ui.button("Close").clicked();
+                });
+            });
+            if close || resp.should_close() {
+                self.known_certs = None;
             }
         }
 
@@ -1750,23 +2542,35 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+/// A window onto the app. The app outlives its window, so it can keep running in the
+/// tray and open a new one later.
+pub struct Window<'a>(pub &'a mut App);
+
+impl eframe::App for Window<'_> {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::App::save(self.0, storage);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        eframe::App::ui(self.0, ui, frame);
+    }
+}
+
+impl App {
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if let Some(ppp) = ctx.input(|i| i.viewport().native_pixels_per_point) {
+            model::set_screen_scale(ppp);
+        }
         self.poll_sessions();
         self.update_probe_targets();
         self.handle_shortcuts(&ctx);
-
-        if self
-            .show_requested
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::SeqCst))
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            // Wayland compositors may refuse to steal focus; flag the window instead.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Informational,
-            ));
-        }
+        self.handle_commands(&ctx);
+        self.sync_integrations();
         if let Some(n) = self.inbox.lock().unwrap().pop() {
             self.notice = Some(n);
         }
@@ -1776,9 +2580,24 @@ impl eframe::App for App {
             // Keep the elapsed-time display, reconnect state and exit detection ticking.
             ctx.request_repaint_after(Duration::from_millis(500));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && any_running && !self.allow_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_quit = true;
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.tray_active() {
+                self.exit = Exit::Hide;
+                if !self.told_about_tray {
+                    self.told_about_tray = true;
+                    self.notify(
+                        "xrdp-gui is still running".into(),
+                        "Open it again from the tray icon. Quit from the tray menu or with Ctrl+Q."
+                            .into(),
+                        false,
+                    );
+                }
+            } else if any_running {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_quit = true;
+            } else {
+                self.exit = Exit::Quit;
+            }
         }
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -1814,10 +2633,31 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        for s in &mut self.sessions {
-            s.terminate();
-        }
+        self.terminate_all();
     }
+}
+
+/// Parses `[DOMAIN\]user@host[:port]` (or `rdp://…`) for quick connect.
+fn parse_quick(text: &str) -> Option<Connection> {
+    let text = text.trim();
+    let text = text.strip_prefix("rdp://").unwrap_or(text);
+    let (user, host) = match text.rsplit_once('@') {
+        Some((u, h)) => (u.trim(), h),
+        None => ("", text),
+    };
+    let (domain, user) = user.split_once('\\').unwrap_or(("", user));
+    let (host, port) = model::split_host_port(host, 3389);
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(Connection {
+        name: host.clone(),
+        host,
+        port,
+        username: user.to_string(),
+        domain: domain.to_string(),
+        ..Default::default()
+    })
 }
 
 fn connection_row(
@@ -1851,6 +2691,21 @@ fn connection_row(
     let mut text = egui::text::LayoutJob::default();
     text.append("● ", 0.0, fmt(dot));
     text.append(c.display_name(), 0.0, fmt(ui.visuals().text_color()));
+    if c.favorite {
+        text.append(" ★", 0.0, fmt(AMBER));
+    }
+    if !c.tags.is_empty() {
+        let tags: Vec<String> = c.tags.iter().map(|t| format!("#{t}")).collect();
+        text.append(
+            &format!("  {}", tags.join(" ")),
+            0.0,
+            egui::TextFormat {
+                color: ui.visuals().weak_text_color(),
+                font_id: egui::FontId::proportional(11.0),
+                ..Default::default()
+            },
+        );
+    }
     match session.map(|s| s.reconnecting()) {
         Some(Some(_)) => text.append("  ⟳", 0.0, fmt(AMBER)),
         Some(None) => text.append("  ▶", 0.0, fmt(GREEN)),
@@ -1861,12 +2716,24 @@ fn connection_row(
         Some(gw) => format!("{}:{} via gateway {}", c.host, c.port, gw.host),
         None => format!("{}:{}", c.host, c.port),
     };
+    let mut hover = format!("{target}\n{reach_text}");
+    if let Some(t) = c
+        .last_used
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+    {
+        let t = t.with_timezone(&chrono::Local);
+        hover.push_str(&format!("\nLast used {}", t.format("%Y-%m-%d %H:%M")));
+    }
+    if let Some(first) = c.notes.lines().find(|l| !l.trim().is_empty()) {
+        hover.push_str(&format!("\n📝 {}", first.trim()));
+    }
+    // A justified layout stretches the row to full width with its text on the left.
     let resp = ui
-        .add_sized(
-            [ui.available_width(), 22.0],
-            egui::Button::selectable(selected, text),
-        )
-        .on_hover_text(format!("{target}\n{reach_text}"));
+        .with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+            ui.add(egui::Button::selectable(selected, text).min_size(egui::vec2(0.0, 22.0)))
+        })
+        .inner
+        .on_hover_text(hover);
     if resp.double_clicked() {
         actions.push(Action::Connect(c.id));
     } else if resp.clicked() {
@@ -1875,6 +2742,14 @@ fn connection_row(
     resp.context_menu(|ui| {
         if ui.button("Connect").clicked() {
             actions.push(Action::Connect(c.id));
+        }
+        let star = if c.favorite {
+            "Remove from favourites"
+        } else {
+            "Add to favourites"
+        };
+        if ui.button(star).clicked() {
+            actions.push(Action::ToggleFavorite(c.id));
         }
         if ui.button("Duplicate").clicked() {
             actions.push(Action::Duplicate(c.id));
@@ -2034,6 +2909,7 @@ mod ui_tests {
                 groups: vec![Group {
                     name: "Work".into(),
                     domain: "CORP".into(),
+                    username: "svc".into(),
                     ..Default::default()
                 }],
                 connections: vec![
@@ -2139,7 +3015,7 @@ mod ui_tests {
 
         // Same for a group whose defaults were being edited.
         let mut h = env.harness();
-        h.get_by_label("Work  ⚙").click();
+        h.get_by_label("Edit group Work").click();
         h.run_steps(3);
         assert!(
             h.state().group_draft.is_some(),
@@ -2319,5 +3195,298 @@ mod ui_tests {
             copied.contains("ERRCONNECT_LOGON_FAILURE [0x00020014]"),
             "log lines missing:\n{copied}"
         );
+    }
+
+    fn has_label(h: &Harness<'static, App>, text: &str) -> bool {
+        h.query_by_label_contains(text).is_some()
+    }
+
+    fn wait_for_sessions(h: &mut Harness<'static, App>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.state().sessions.iter().any(Session::is_running) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake client did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            h.step();
+        }
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn groups_are_an_accordion() {
+        let env = TestEnv::new("accordion");
+        let mut h = env.harness();
+        assert!(has_label(&h, "Alpha") && has_label(&h, "Beta"));
+
+        // Clicking a group's name collapses it…
+        h.get_by_label("Ungrouped (1)").click();
+        h.run_steps(10);
+        assert!(!has_label(&h, "Alpha"), "Ungrouped should collapse");
+        assert!(has_label(&h, "Beta"));
+
+        // …and opening it again closes the other groups.
+        h.get_by_label("Ungrouped (1)").click();
+        h.run_steps(10);
+        assert!(has_label(&h, "Alpha"));
+        assert!(
+            !has_label(&h, "Beta"),
+            "opening a group should close the others"
+        );
+
+        // With the accordion off, groups open and close independently.
+        h.state_mut().config.settings.accordion = false;
+        h.get_by_label("Work (1)").click();
+        h.run_steps(10);
+        assert!(has_label(&h, "Alpha") && has_label(&h, "Beta"));
+
+        // Searching shows every match, even in collapsed groups.
+        h.get_by_label("Work (1)").click();
+        h.run_steps(10);
+        assert!(!has_label(&h, "Beta"));
+        h.state_mut().search = "beta".into();
+        h.run_steps(10);
+        assert!(
+            has_label(&h, "Beta"),
+            "search should reveal collapsed matches"
+        );
+        h.state_mut().search.clear();
+        h.run_steps(10);
+        assert!(
+            !has_label(&h, "Beta"),
+            "search must not change what was collapsed"
+        );
+    }
+
+    #[test]
+    fn favourites_and_recent() {
+        let env = TestEnv::new("favourites");
+        let mut h = env.harness();
+        assert!(!has_label(&h, "★ Favourites") && !has_label(&h, "🕘 Recent"));
+
+        select_alpha(&mut h);
+        h.get_by_label("Favourite").click();
+        h.run_steps(3);
+        assert!(h.state().config.connections[0].favorite);
+        assert!(!h.state().conn_dirty(), "starring saves immediately");
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert!(
+            saved
+                .connections
+                .iter()
+                .any(|c| c.name == "Alpha" && c.favorite)
+        );
+        assert!(has_label(&h, "★ Favourites"));
+        let menu = {
+            let (f, r) = h.state().favourites_and_recent();
+            (ids(&f), ids(&r))
+        };
+        assert_eq!(menu.0, [h.state().config.connections[0].id]);
+
+        // Connecting makes Beta "recent" (Alpha is a favourite, so not listed twice).
+        h.state_mut().connect_target("Beta");
+        h.run_steps(2);
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(3);
+        wait_for_sessions(&mut h);
+        assert!(has_label(&h, "🕘 Recent"));
+        let (_, recent) = h.state().favourites_and_recent();
+        assert_eq!(names(&recent), ["Beta"]);
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert!(
+            saved
+                .connections
+                .iter()
+                .any(|c| c.name == "Beta" && c.last_used.is_some())
+        );
+    }
+
+    fn ids(list: &[&Connection]) -> Vec<Uuid> {
+        list.iter().map(|c| c.id).collect()
+    }
+
+    fn names<'a>(list: &[&'a Connection]) -> Vec<&'a str> {
+        list.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn quick_connect() {
+        let env = TestEnv::new("quick");
+        let mut h = env.harness();
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::L);
+        h.run_steps(2);
+        h.input_mut()
+            .events
+            .push(egui::Event::Text("CORP\\bob@10.0.0.9:3390".into()));
+        h.run_steps(2);
+        assert_eq!(
+            h.state().quick,
+            "CORP\\bob@10.0.0.9:3390",
+            "Ctrl+L focuses quick connect"
+        );
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+
+        let p = h.state().prompt.as_ref().expect("asks for the password");
+        assert_eq!(p.target, "CORP\\bob@10.0.0.9");
+        assert!(
+            p.save_to.is_none(),
+            "quick connections can't save passwords"
+        );
+        assert!(!has_label(&h, "Save in keyring"));
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().sessions.len(), 1);
+        let cmd = &h.state().sessions[0].command;
+        assert!(
+            cmd.contains("/v:10.0.0.9") && cmd.contains("/port:3390"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("/u:bob") && cmd.contains("/d:CORP"), "{cmd}");
+        assert_eq!(h.state().config.connections.len(), 2, "nothing is saved");
+        wait_for_sessions(&mut h);
+
+        // A saved connection's name works too.
+        h.state_mut().quick = "alpha".into();
+        h.state_mut().actions.push(Action::QuickConnect);
+        h.run_steps(3);
+        assert_eq!(h.state().prompt.as_ref().unwrap().conn.name, "Alpha");
+    }
+
+    #[test]
+    fn group_credentials_in_prompt() {
+        let env = TestEnv::new("groupcreds");
+        let mut h = env.harness();
+        // Beta has no username, so it uses group Work's (svc, domain CORP).
+        h.state_mut().connect_target("Beta");
+        h.run_steps(3);
+        let p = h
+            .state()
+            .prompt
+            .as_ref()
+            .expect("asks for the group password");
+        assert_eq!(p.target, "CORP\\svc@127.0.0.2");
+        assert!(matches!(&p.save_to, Some((Key::GroupRdp(g), _)) if g == "Work"));
+        assert!(has_label(&h, "Save in keyring for group “Work”"));
+        h.state_mut().prompt = None;
+
+        // The group editor shows username, domain and password together.
+        h.get_by_label("Edit group Work").click();
+        h.run_steps(5);
+        for (label, value) in [("Username", "svc"), ("Domain", "CORP")] {
+            assert!(
+                h.query_by(|n| n.role() == Role::TextInput
+                    && n.label().as_deref() == Some(label)
+                    && n.value().as_deref() == Some(value))
+                    .is_some(),
+                "group editor should show {label} = {value}"
+            );
+        }
+        assert!(
+            h.query_by(|n| n.label().as_deref() == Some("Group password"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tags_and_notes() {
+        let env = TestEnv::new("tags");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+        h.get_by_label("Notes").click(); // expand the section
+        h.run_steps(3);
+        h.get_by(|n| n.role() == Role::TextInput && n.label().as_deref() == Some("Tags"))
+            .focus();
+        h.run_steps(2);
+        h.input_mut()
+            .events
+            .push(egui::Event::Text("prod, #SQL, prod".into()));
+        h.run_steps(2);
+        assert_eq!(h.state().draft.as_ref().unwrap().conn.tags, ["prod", "SQL"]);
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::S);
+        h.run_steps(3);
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert_eq!(saved.connections[0].tags, ["prod", "SQL"]);
+
+        h.state_mut().search = "#sql".into();
+        h.run_steps(5);
+        assert!(has_label(&h, "#prod #SQL"), "tags are shown in the list");
+        assert!(!has_label(&h, "Beta"), "#tag search matches tags only");
+    }
+
+    #[test]
+    fn commands_from_tray_and_other_launches() {
+        let env = TestEnv::new("commands");
+        let mut h = env.harness();
+        // `xrdp-gui --connect Alpha` while running.
+        h.state().bus.send(Command::Connect {
+            target: "Alpha".into(),
+            token: None,
+        });
+        h.run_steps(3);
+        assert_eq!(h.state().prompt.as_ref().unwrap().conn.name, "Alpha");
+        h.state_mut().prompt = None;
+
+        // While the window is closed to the tray: show, connect (needs the window for
+        // the password prompt) and quit.
+        let app = h.state_mut();
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Show {
+            token: Some("t1".into()),
+        });
+        assert!(matches!(app.run_hidden(), Next::Show(Some(t)) if t == "t1"));
+
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Connect {
+            target: "Beta".into(),
+            token: None,
+        });
+        assert!(matches!(app.run_hidden(), Next::Show(None)));
+        assert_eq!(app.prompt.as_ref().unwrap().conn.name, "Beta");
+
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Quit);
+        assert!(matches!(app.run_hidden(), Next::Quit));
+
+        app.exit = Exit::Quit;
+        assert!(matches!(app.run_hidden(), Next::Quit));
+    }
+
+    #[test]
+    fn certificate_manager_opens() {
+        let env = TestEnv::new("certs");
+        let mut h = env.harness();
+        h.get_by_label("🔒 Certificates").click();
+        h.run_steps(3);
+        assert!(h.state().known_certs.is_some());
+        assert!(has_label(&h, "Trusted server certificates"));
+        // The grid takes a couple of frames to settle its layout.
+        h.run_steps(5);
+        h.get_by_label("Close").click();
+        h.run_steps(3);
+        assert!(h.state().known_certs.is_none());
+    }
+
+    #[test]
+    fn quick_connect_parsing() {
+        let c = parse_quick(" rdp://CORP\\bob@[::1]:3390 ").unwrap();
+        assert_eq!(
+            (
+                c.domain.as_str(),
+                c.username.as_str(),
+                c.host.as_str(),
+                c.port
+            ),
+            ("CORP", "bob", "::1", 3390)
+        );
+        let c = parse_quick("pc1").unwrap();
+        assert_eq!(
+            (c.username.as_str(), c.host.as_str(), c.port),
+            ("", "pc1", 3389)
+        );
+        assert!(parse_quick("  ").is_none());
+        assert!(parse_quick("bob@").is_none());
+        assert!(parse_quick("two words").is_none());
     }
 }

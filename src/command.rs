@@ -29,7 +29,7 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
     if conn.port != 3389 {
         args.push(format!("/port:{}", conn.port));
     }
-    push_nonempty(&mut args, "/u:", &conn.username);
+    push_nonempty(&mut args, "/u:", &r.username);
     push_nonempty(&mut args, "/d:", &r.domain);
     if let Some(p) = creds.password {
         args.push(format!("/p:{p}"));
@@ -48,6 +48,16 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
     }
     if conn.dynamic_resolution {
         args.push("+dynamic-resolution".into());
+    }
+    if let Some(p) = r.scale.filter(|&p| p != 100) {
+        // Desktop scale takes any percentage; the device (app) scale only these three.
+        let device = match p {
+            ..=120 => 100,
+            121..=160 => 140,
+            _ => 180,
+        };
+        args.push(format!("/scale-desktop:{p}"));
+        args.push(format!("/scale-device:{device}"));
     }
     args.extend(r.profile.args().iter().map(|a| a.to_string()));
 
@@ -73,7 +83,7 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
     }
 
     if let Some(gw) = &r.gateway {
-        args.push(gateway_arg(gw, &conn.username, &r.domain, creds)?);
+        args.push(gateway_arg(gw, &r.username, &r.domain, creds)?);
     }
 
     match r.cert {
@@ -242,6 +252,56 @@ mod tests {
                 "/log-level:WARN",
             ]
         );
+    }
+
+    #[test]
+    fn hidpi_scaling() {
+        use crate::model::Scaling;
+        let scaled = |scaling| {
+            let c = Connection { scaling, ..conn() };
+            build(&c, &NO_CREDS)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.starts_with("/scale"))
+                .collect::<Vec<_>>()
+        };
+        assert!(scaled(Scaling::Off).is_empty());
+        assert!(scaled(Scaling::Percent(100)).is_empty());
+        assert_eq!(
+            scaled(Scaling::Percent(150)),
+            ["/scale-desktop:150", "/scale-device:140"]
+        );
+        assert_eq!(
+            scaled(Scaling::Percent(200)),
+            ["/scale-desktop:200", "/scale-device:180"]
+        );
+    }
+
+    #[test]
+    fn group_credentials_are_used() {
+        let config = Config {
+            groups: vec![Group {
+                name: "Work".into(),
+                username: "svc".into(),
+                domain: "CORP".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let c = Connection {
+            group: "Work".into(),
+            username: String::new(),
+            domain: String::new(),
+            ..conn()
+        };
+        let creds = Credentials {
+            password: Some("pw"),
+            gateway_password: None,
+        };
+        let args = build_args(&config.resolve(&c), &Settings::default(), &creds).unwrap();
+        assert!(args.contains(&"/u:svc".into()), "{args:?}");
+        assert!(args.contains(&"/d:CORP".into()));
+        assert!(args.contains(&"/p:pw".into()));
     }
 
     #[test]
