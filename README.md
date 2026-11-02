@@ -18,7 +18,9 @@ It stores your RDP connections and launches `sdl-freerdp` (or `xfreerdp`) for th
 - **HiDPI scaling**: scale the remote desktop to 125–300%, or match the local screen
   (`/scale-desktop`)
 - **Certificate manager**: see which server certificates FreeRDP trusts (subject, expiry,
-  SHA-256 fingerprint, which connections use them) and forget one
+  SHA-256 fingerprint, which connections use them) and forget one. After forgetting, the next
+  connection asks you to check the new certificate instead of trusting it unseen
+  (sdl-freerdp shows the question)
 - **Host status dots**: green/red per connection from a background check of the RDP port
   (or the gateway, when one is used) every 30 s
 - **Performance profiles**: LAN, VPN and WAN presets (`/network:`, `/gfx:AVC444`/`AVC420`,

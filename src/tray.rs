@@ -113,7 +113,7 @@ fn connect_items(entries: &[Entry]) -> Vec<MenuItem<XrdpTray>> {
             // Menu labels treat '_' as a mnemonic marker.
             let mut label = e.name.replace('_', "__");
             if e.running {
-                label.push_str("  (connected)");
+                label.push_str("  (running)");
             }
             item(label, "network-connect", move |t| {
                 t.bus.send(Command::Connect {

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::certs;
 use crate::secrets::Key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,9 +420,19 @@ impl Default for Settings {
     }
 }
 
+/// A server whose saved certificate was forgotten. Until FreeRDP has saved a new one,
+/// connecting asks instead of silently trusting whatever the server presents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertReview {
+    pub host: String,
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cert_review: Vec<CertReview>,
     pub settings: Settings,
     pub groups: Vec<Group>,
     pub connections: Vec<Connection>,
@@ -501,8 +512,32 @@ impl Config {
         self.connections.iter().find(|c| c.id == id)
     }
 
+    /// Whether `host:port` had its certificate forgotten and awaits a new one.
+    fn awaiting_cert_review(&self, host: &str, port: u16) -> bool {
+        let host = certs::store_host(host);
+        self.cert_review
+            .iter()
+            .any(|r| r.port == port && r.host == host)
+    }
+
     pub fn resolve(&self, conn: &Connection) -> Resolved {
         let group = self.group(&conn.group);
+        let gateway = self.gateway(conn);
+        let cert = conn
+            .cert
+            .or(group.and_then(|g| g.cert))
+            .unwrap_or(CertPolicy::DEFAULT);
+        // Trust on first use would accept the replacement of a forgotten certificate unseen.
+        let review = self.awaiting_cert_review(&conn.host, conn.port)
+            || gateway.as_ref().is_some_and(|gw| {
+                let (host, port) = split_host_port(&gw.host, 443);
+                self.awaiting_cert_review(&host, port)
+            });
+        let cert = if cert == CertPolicy::Tofu && review {
+            CertPolicy::Ask
+        } else {
+            cert
+        };
         // A connection without its own username uses its group's credentials.
         let creds_group = group.filter(|g| {
             conn.username.trim().is_empty()
@@ -531,15 +566,12 @@ impl Config {
             password_key,
             creds_from_group: creds_group.map(|g| g.name.clone()),
             scale: conn.scaling.percent(),
-            cert: conn
-                .cert
-                .or(group.and_then(|g| g.cert))
-                .unwrap_or(CertPolicy::DEFAULT),
+            cert,
             profile: conn
                 .profile
                 .or(group.and_then(|g| g.profile))
                 .unwrap_or(Profile::DEFAULT),
-            gateway: self.gateway(conn),
+            gateway,
         }
     }
 
@@ -652,6 +684,53 @@ mod tests {
             ("", CertPolicy::DEFAULT, Profile::DEFAULT)
         );
         assert!(r.gateway.is_none());
+    }
+
+    #[test]
+    fn forgotten_certificates_ask_instead_of_trusting() {
+        let mut config = Config {
+            cert_review: vec![
+                CertReview {
+                    host: "pc1".into(),
+                    port: 3389,
+                },
+                CertReview {
+                    host: "gw.corp".into(),
+                    port: 8443,
+                },
+            ],
+            ..Default::default()
+        };
+        let conn = |host: &str| Connection {
+            host: host.into(),
+            ..Default::default()
+        };
+        assert_eq!(config.resolve(&conn("PC1")).cert, CertPolicy::Ask);
+        assert_eq!(config.resolve(&conn("pc2")).cert, CertPolicy::Tofu);
+        let other_port = Connection {
+            port: 3390,
+            ..conn("pc1")
+        };
+        assert_eq!(config.resolve(&other_port).cert, CertPolicy::Tofu);
+        let via_gateway = Connection {
+            gateway: GatewayMode::On,
+            gateway_host: "gw.corp:8443".into(),
+            ..conn("pc2")
+        };
+        assert_eq!(config.resolve(&via_gateway).cert, CertPolicy::Ask);
+        // A stricter or explicit policy is left alone.
+        let deny = Connection {
+            cert: Some(CertPolicy::Deny),
+            ..conn("pc1")
+        };
+        assert_eq!(config.resolve(&deny).cert, CertPolicy::Deny);
+
+        // It survives a restart, and an empty list isn't written at all.
+        let saved = toml::to_string(&config).unwrap();
+        let back: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(back.cert_review, config.cert_review);
+        config.cert_review.clear();
+        assert!(!toml::to_string(&config).unwrap().contains("cert_review"));
     }
 
     #[test]

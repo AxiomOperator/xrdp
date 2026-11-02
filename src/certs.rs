@@ -33,9 +33,18 @@ pub fn dir() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("freerdp/server"))
 }
 
+/// A host as FreeRDP's store names it: lower case, and an IPv6 address has no brackets and
+/// its colons replaced (`[::1]` is stored as `..1`).
+pub fn store_host(host: &str) -> String {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .to_lowercase()
+        .replace(':', ".")
+}
+
 /// Where FreeRDP keeps the certificate it trusts for `host:port`.
 pub fn path_for(host: &str, port: u16) -> Result<PathBuf> {
-    Ok(dir()?.join(format!("{}_{port}.pem", host.trim().to_lowercase())))
+    Ok(dir()?.join(format!("{}_{port}.pem", store_host(host))))
 }
 
 /// All trusted certificates, sorted by host.
@@ -59,7 +68,8 @@ fn list_in(dir: &Path) -> Result<Vec<KnownCert>> {
     Ok(certs)
 }
 
-fn read(path: &Path) -> KnownCert {
+/// Reads the certificate in `path`; problems end up in its `error`.
+pub fn read(path: &Path) -> KnownCert {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -131,6 +141,13 @@ c3QuZXhhbXBsZTAeFw0yNDAxMDEwMDAwMDBaFw0zNDAxMDEwMDAwMDBaMBcxFTAT
 BgNVBAMMDHRlc3QuZXhhbXBsZTBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC7o96F
 -----END CERTIFICATE-----
 ";
+
+    #[test]
+    fn store_names_match_freerdp() {
+        assert_eq!(store_host(" DC01.Corp "), "dc01.corp");
+        assert_eq!(store_host("::1"), "..1");
+        assert_eq!(store_host("[FE80::1]"), "fe80..1");
+    }
 
     #[test]
     fn lists_and_parses() {

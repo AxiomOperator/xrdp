@@ -19,6 +19,16 @@ pub enum Fix {
     ForgetCertificate,
 }
 
+/// A certificate FreeRDP refused, as named in its log. With a gateway this may be the
+/// gateway's certificate rather than the target's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CertIssue {
+    pub host: String,
+    pub port: u16,
+    /// SHA-256 of the refused certificate, as colon-separated upper-case hex.
+    pub new_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnosis {
     pub title: String,
@@ -27,6 +37,8 @@ pub struct Diagnosis {
     pub fix: Option<Fix>,
     /// The FreeRDP code the explanation was derived from.
     pub code: Option<String>,
+    /// Set when the explanation is a changed certificate.
+    pub cert: Option<CertIssue>,
 }
 
 enum Pattern {
@@ -46,6 +58,8 @@ struct Rule {
 use Pattern::{Code, CodePrefix, Text};
 use Severity::{Dropped, Failed, Normal};
 
+const CERT_REFUSED: &str = "certificate not trusted, aborting";
+
 /// Ordered from most to least specific: FreeRDP often logs a precise code followed by
 /// generic ones such as `ERRCONNECT_CONNECT_FAILED`.
 const RULES: &[Rule] = &[
@@ -53,6 +67,11 @@ const RULES: &[Rule] = &[
         patterns: &[
             Text("has changed!!!"),
             Text("does not match the certificate used for previous"),
+            // What libfreerdp logs when it refuses a certificate. Its warnings can't be
+            // relied on: it logs "REMOTE HOST IDENTIFICATION HAS CHANGED" for a certificate
+            // it has never seen, even when accepting it. This covers unknown certificates
+            // too; `Session::poll` tells them apart.
+            Text(CERT_REFUSED),
         ],
         title: "The server's certificate changed",
         hint: "The computer presented a different certificate than last time. This is normal after it was \
@@ -372,6 +391,48 @@ fn from_rule(rule: &Rule, code: Option<&str>) -> Diagnosis {
         severity: rule.severity,
         fix: rule.fix,
         code: code.map(str::to_string),
+        cert: None,
+    }
+}
+
+/// Finds which certificate FreeRDP refused, for any of the ways it words that.
+fn cert_issue(log: &[String]) -> Option<CertIssue> {
+    // From the end: the warnings of a certificate accepted earlier may come first.
+    let endpoint = log.iter().rev().find_map(|l| {
+        let named = if let Some((_, rest)) = l.split_once("New host key for ") {
+            rest
+        } else if let Some((_, rest)) = l.split_once("The host key for ") {
+            rest.split(" has changed").next()?
+        } else {
+            l.split_once("Certificate for ")?.1.split(" (").next()?
+        };
+        let (host, port) = named.trim().rsplit_once(':')?;
+        Some((host.to_string(), port.parse().ok()?))
+    });
+    let (host, port) = endpoint?;
+    let new_fingerprint = log.iter().rev().find_map(|l| {
+        let (_, rest) = l.split_once("sent by the remote host is ")?;
+        Some(rest.trim().to_uppercase())
+    });
+    Some(CertIssue {
+        host,
+        port,
+        new_fingerprint,
+    })
+}
+
+/// FreeRDP refused a certificate it has no saved copy of, so nothing changed.
+pub fn untrusted_certificate() -> Diagnosis {
+    Diagnosis {
+        title: "The server's certificate isn't trusted".into(),
+        hint: "FreeRDP refused this computer's certificate because it hasn't been trusted yet. \
+               The connection's certificate policy (under Advanced) decides how new \
+               certificates are handled."
+            .into(),
+        severity: Failed,
+        fix: None,
+        code: None,
+        cert: None,
     }
 }
 
@@ -383,6 +444,7 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
             severity: Normal,
             fix: None,
             code: None,
+            cert: None,
         };
     }
 
@@ -398,7 +460,13 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
         .flat_map(|l| codes_in(l))
         .filter(|c| !c.ends_with("_SUCCESS") && !c.ends_with("_NONE"))
         .collect();
-    for rule in RULES {
+    // A clean exit means the connection did come up, so anything logged about failing to
+    // connect was recovered from (a security protocol that was tried first, say).
+    let clean_exit = exit.code() == Some(0);
+    for rule in RULES
+        .iter()
+        .filter(|r| !(clean_exit && r.severity == Failed))
+    {
         for pattern in rule.patterns {
             let hit = match pattern {
                 Code(want) => codes.iter().find(|c| *c == want).copied(),
@@ -406,7 +474,15 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
                 Text(text) => log.iter().any(|l| l.contains(text)).then_some(""),
             };
             if let Some(code) = hit {
-                return from_rule(rule, Some(code).filter(|c| !c.is_empty()));
+                let mut diagnosis = from_rule(rule, Some(code).filter(|c| !c.is_empty()));
+                if rule.fix == Some(Fix::ForgetCertificate) {
+                    diagnosis.cert = cert_issue(log);
+                    // Refused, but we can't tell which certificate, so not whether it changed.
+                    if diagnosis.cert.is_none() && log.iter().any(|l| l.contains(CERT_REFUSED)) {
+                        return untrusted_certificate();
+                    }
+                }
+                return diagnosis;
             }
         }
     }
@@ -418,20 +494,35 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
             severity: Normal,
             fix: None,
             code: None,
+            cert: None,
         },
         // FreeRDP's command-line parser fails with winpr's COMMAND_LINE_ERROR codes,
         // -1000 to -1006 (an unknown option is -1000, a bad value -1002), which the exit
         // status truncates to a byte: 24 down to 18.
         Some(128 | 18..=24) => Diagnosis {
             title: "FreeRDP rejected the options".into(),
-            hint: "One of the arguments isn't valid for this FreeRDP version — check the extra arguments.".into(),
+            hint: if log.is_empty() && exit.code() != Some(128) {
+                // Licensing errors use the same exit codes, and normally log a code that
+                // a rule above matches.
+                "One of the arguments isn't valid for this FreeRDP version — check the extra \
+                 arguments. With logging off this can also be a Remote Desktop licensing error; \
+                 raise the log level in Settings to tell them apart."
+                    .into()
+            } else {
+                "One of the arguments isn't valid for this FreeRDP version — check the extra arguments.".into()
+            },
             severity: Failed,
             fix: None,
             code: None,
+            cert: None,
         },
         Some(n) => {
             if let Some(name) = exit_code_name(n)
-                && let Some(rule) = RULES.iter().find(|r| r.patterns.iter().any(|p| matches!(p, Code(c) if *c == name)))
+                && let Some(rule) = RULES.iter().find(|r| {
+                    r.patterns
+                        .iter()
+                        .any(|p| matches!(p, Code(c) if *c == name))
+                })
             {
                 return from_rule(rule, Some(name));
             }
@@ -441,6 +532,7 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
                 severity: Failed,
                 fix: None,
                 code: codes.last().map(|c| c.to_string()),
+                cert: None,
             }
         }
         None => Diagnosis {
@@ -449,6 +541,7 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
             severity: Dropped,
             fix: None,
             code: None,
+            cert: None,
         },
     }
 }
@@ -504,6 +597,81 @@ mod tests {
         let d = diagnose(&log, exit(131), false);
         assert_eq!(d.fix, Some(Fix::ForgetCertificate));
         assert_eq!(d.severity, Failed);
+    }
+
+    /// As logged by sdl-freerdp 3.32 for a changed certificate with /cert:tofu.
+    #[test]
+    fn real_changed_certificate_log() {
+        let log = lines(&[
+            "[ERROR][com.freerdp.crypto] - [tls_print_certificate_error]: New host key for gw.corp:443",
+            "[ERROR][com.freerdp.crypto] - [tls_print_certificate_error]: @    WARNING: NEW HOST IDENTIFICATION!     @",
+            "[ERROR][com.freerdp.crypto] - [tls_print_certificate_error]: The fingerprint for the host key sent by the remote host is 34:23:5b:d4:b9",
+            "[ERROR][com.freerdp.crypto] - [freerdp_tls_handshake]: certificate not trusted, aborting.",
+            "[ERROR][com.freerdp.core] - [transport_default_connect_tls]: ERRCONNECT_TLS_CONNECT_FAILED [0x00020008]",
+        ]);
+        let d = diagnose(&log, exit(143), false);
+        assert_eq!(d.title, "The server's certificate changed");
+        assert_eq!(d.fix, Some(Fix::ForgetCertificate));
+        assert_eq!(
+            d.cert,
+            Some(CertIssue {
+                host: "gw.corp".into(),
+                port: 443,
+                new_fingerprint: Some("34:23:5B:D4:B9".into()),
+            })
+        );
+    }
+
+    /// As logged by sdl-freerdp 3.32 for an unknown certificate with /cert:deny.
+    #[test]
+    fn real_refused_certificate_log_names_the_host() {
+        let log = lines(&[
+            "[ERROR][com.freerdp.crypto] - [tls_print_new_certificate_warn]: The host key for 10.0.0.5:3390 has changed",
+            "[ERROR][com.freerdp.crypto] - [tls_print_new_certificate_warn]: @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "[ERROR][com.freerdp.crypto] - [freerdp_tls_handshake]: certificate not trusted, aborting.",
+            "[ERROR][com.freerdp.core] - [transport_default_connect_tls]: ERRCONNECT_TLS_CONNECT_FAILED [0x00020008]",
+        ]);
+        let cert = diagnose(&log, exit(143), false).cert.unwrap();
+        assert_eq!((cert.host.as_str(), cert.port), ("10.0.0.5", 3390));
+        assert_eq!(cert.new_fingerprint, None);
+    }
+
+    /// FreeRDP warns about a first-seen certificate even when it accepts it, so what went
+    /// wrong afterwards must still be reported.
+    #[test]
+    fn warnings_about_an_accepted_certificate_are_not_a_change() {
+        let log = lines(&[
+            "[ERROR][com.freerdp.crypto] - [tls_print_new_certificate_warn]: The host key for 10.0.0.5:3389 has changed",
+            "[ERROR][com.freerdp.crypto] - [tls_print_new_certificate_warn]: @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "[ERROR][com.freerdp.core] - [nla_client]: ERRCONNECT_LOGON_FAILURE [0x00020014]",
+        ]);
+        let d = diagnose(&log, exit(134), false);
+        assert_eq!(d.title, "Wrong username or password");
+        assert_eq!(d.cert, None);
+    }
+
+    /// Refused without naming a host, FreeRDP's wording may have changed: don't claim more
+    /// than is known.
+    #[test]
+    fn refusal_without_a_host_is_only_untrusted() {
+        let log = lines(&["[ERROR] [freerdp_tls_handshake]: certificate not trusted, aborting."]);
+        let d = diagnose(&log, exit(143), false);
+        assert_eq!(d.title, "The server's certificate isn't trusted");
+        assert_eq!(d.fix, None);
+    }
+
+    #[test]
+    fn clean_exit_ignores_connection_failures() {
+        let nego = lines(&["[ERROR] x: ERRCONNECT_SECURITY_NEGO_CONNECT_FAILED [0x0002000C]"]);
+        let d = diagnose(&nego, exit(0), false);
+        assert_eq!((d.title.as_str(), d.severity), ("Session ended", Normal));
+        assert_eq!(diagnose(&nego, exit(133), false).severity, Failed);
+
+        // Ways a working session ends still explain themselves.
+        let logoff = lines(&["[ERROR] x: ERRINFO_LOGOFF_BY_USER [0x0000000C]"]);
+        assert_eq!(diagnose(&logoff, exit(0), false).title, "Signed out");
+        let taken = lines(&["[ERROR] x: ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION [0x00000005]"]);
+        assert_eq!(diagnose(&taken, exit(0), false).severity, Dropped);
     }
 
     #[test]

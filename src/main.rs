@@ -12,7 +12,8 @@ mod session;
 mod single_instance;
 mod tray;
 
-use std::sync::{PoisonError, RwLock};
+use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use bus::Command;
 use eframe::egui;
@@ -23,6 +24,20 @@ use eframe::egui;
 /// `getenv` isn't safe against a concurrent `setenv`. Rust's own `std::env` is already
 /// locked internally.
 pub static ENV_LOCK: RwLock<()> = RwLock::new(());
+
+/// `ENV_LOCK` for writing, unless a stuck lookup holds it for longer than `patience`: a
+/// host-name lookup can take many seconds, which mustn't freeze the app.
+fn env_write_lock(patience: Duration) -> Option<RwLockWriteGuard<'static, ()>> {
+    let deadline = Instant::now() + patience;
+    loop {
+        match ENV_LOCK.try_write() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
 
 const USAGE: &str = "\
 Usage: xrdp-gui [--connect <target>]
@@ -106,8 +121,10 @@ fn main() -> eframe::Result {
     let mut app: Option<app::App> = None;
     loop {
         let mut env_guard = None;
-        if let Some(t) = token.take() {
-            let guard = ENV_LOCK.write().unwrap_or_else(PoisonError::into_inner);
+        // Without the lock the window still opens, it just may not take focus.
+        if let Some(t) = token.take()
+            && let Some(guard) = env_write_lock(Duration::from_millis(250))
+        {
             // egui-winit hands this to the new window so it may take focus.
             // SAFETY: other threads only read the environment through `std::env` (which
             // serialises with this) or while holding ENV_LOCK, which we hold until the
@@ -144,6 +161,15 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn stuck_lookup_only_delays_the_window_briefly() {
+        let lookup = ENV_LOCK.read().unwrap();
+        let start = Instant::now();
+        assert!(env_write_lock(Duration::from_millis(50)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(lookup);
     }
 
     #[test]

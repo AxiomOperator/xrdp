@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use eframe::egui::{self, Color32, Key as KeyCode, KeyboardShortcut, Modifiers, RichText};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,10 +12,10 @@ use crate::bus::{Bus, Command};
 use crate::certs::{self, KnownCert};
 use crate::command::{self, Credentials};
 use crate::desktop;
-use crate::diagnose::{Fix, Severity};
+use crate::diagnose::{CertIssue, Fix, Severity};
 use crate::model::{
-    self, CertPolicy, ClipboardShare, Config, Connection, GatewayMode, Group, Profile, Resolved,
-    Scaling, Settings,
+    self, CertPolicy, CertReview, ClipboardShare, Config, Connection, GatewayMode, Group, Profile,
+    Resolved, Scaling, Settings,
 };
 use crate::notify;
 use crate::probe::{Prober, Reach, Target};
@@ -67,6 +67,8 @@ const AMBER: Color32 = Color32::from_rgb(230, 170, 60);
 /// The connection being edited, plus any newly typed passwords (never persisted to disk).
 struct Draft {
     conn: Connection,
+    /// The connection as it was when editing started.
+    pristine: Connection,
     password: String,
     gateway_password: String,
     /// The tags as typed; parsed into `conn.tags` as you type.
@@ -78,6 +80,7 @@ impl Draft {
     fn new(conn: Connection, is_new: bool) -> Self {
         Self {
             tags_text: conn.tags.join(", "),
+            pristine: conn.clone(),
             conn,
             password: String::new(),
             gateway_password: String::new(),
@@ -91,6 +94,9 @@ struct GroupDraft {
     group: Group,
     /// The group as currently saved (or an empty one if it has no saved defaults).
     original: Group,
+    /// For a group not created yet: how it started out, so one left untouched can simply
+    /// be dropped.
+    new_from: Option<Group>,
     password: String,
     gateway_password: String,
 }
@@ -104,6 +110,7 @@ impl GroupDraft {
         Self {
             group: original.clone(),
             original,
+            new_from: None,
             password: String::new(),
             gateway_password: String::new(),
         }
@@ -135,6 +142,16 @@ struct GatewayPrompt {
     password: String,
     save_to: Option<(Key, String)>,
     remember: bool,
+}
+
+/// A saved certificate about to be forgotten, once the user has compared fingerprints.
+struct CertForget {
+    host: String,
+    port: u16,
+    path: PathBuf,
+    old_fingerprint: Option<String>,
+    /// From FreeRDP's log, when forgetting because the server presented a new one.
+    new_fingerprint: Option<String>,
 }
 
 /// Passwords read from the keyring for a connection about to be launched.
@@ -192,12 +209,21 @@ enum Action {
     Forget(Key),
     /// Forgets whichever password the connection uses (its own or its group's).
     ForgetPassword(Uuid),
-    ForgetCertificate(Uuid),
+    /// Asks about forgetting the certificate FreeRDP refused, or else the connection's.
+    ForgetCertificate(Uuid, Option<CertIssue>),
     ToggleFavorite(Uuid),
     Connect(Uuid),
+    /// Starts another session although the connection already has one.
+    ConnectAnyway(Uuid),
     QuickConnect,
     OpenCertificates,
-    ForgetKnownCert(PathBuf),
+    AskForgetKnownCert {
+        host: String,
+        port: u16,
+        path: PathBuf,
+        fingerprint: String,
+    },
+    ForgetCertConfirmed,
     AskQuit,
     Launch,
     Stop(usize),
@@ -219,6 +245,9 @@ pub struct App {
     log_session: Option<usize>,
     prompt: Option<PasswordPrompt>,
     confirm_delete: Option<Uuid>,
+    /// A connection that already has a running session, and was asked to connect again.
+    confirm_second: Option<Uuid>,
+    confirm_forget_cert: Option<CertForget>,
     settings_draft: Option<Settings>,
     confirm_quit: bool,
     /// Why pending edits couldn't be saved on quit; shown in the quit dialog.
@@ -237,7 +266,8 @@ pub struct App {
     keyring: secrets::Queue,
     /// Finished keyring work, waiting to be handled on the UI thread.
     keyring_done: Arc<Mutex<Vec<KeyringDone>>>,
-    pending_lookups: usize,
+    /// Connections whose passwords are being read from the keyring.
+    pending_lookups: Vec<Uuid>,
     /// Set by a request from the tray or another launch: the activation token to bring
     /// the window forward with if that request ends up asking for a password.
     raise_for_prompt: Option<Option<String>>,
@@ -310,6 +340,8 @@ impl App {
             log_session: None,
             prompt: None,
             confirm_delete: None,
+            confirm_second: None,
+            confirm_forget_cert: None,
             settings_draft: None,
             confirm_quit: false,
             quit_save_error: None,
@@ -322,7 +354,7 @@ impl App {
             inbox: Arc::default(),
             keyring: secrets::Queue::new(),
             keyring_done: Arc::default(),
-            pending_lookups: 0,
+            pending_lookups: Vec::new(),
             raise_for_prompt: None,
             errors: 0,
             config_version: std::cell::Cell::new(0),
@@ -353,6 +385,22 @@ impl App {
         self.bus.set_ctx(Some(cc.egui_ctx.clone()));
         self.exit = Exit::Quit;
         self.allow_close = false;
+        self.prober.set_paused(false);
+    }
+
+    /// Whether a request is waiting on an answer that only the window can give.
+    fn needs_window(&self) -> bool {
+        self.prompt.is_some() || self.confirm_second.is_some()
+    }
+
+    /// Closes the window but keeps running in the tray. Questions still open are
+    /// cancelled, or they would bring the window straight back.
+    fn hide_to_tray(&mut self) {
+        self.exit = Exit::Hide;
+        self.prompt = None;
+        self.confirm_second = None;
+        self.confirm_quit = false;
+        self.quit_save_error = None;
     }
 
     /// Runs while the window is closed (in the tray), until it should open again or
@@ -364,36 +412,40 @@ impl App {
             Exit::Reopen(token) => return Next::Show(token),
             Exit::Hide => {}
         }
+        // Nothing shows the status dots while the window is closed.
+        self.prober.set_paused(true);
         let errors = self.errors;
         loop {
             self.bus.wait(Duration::from_millis(500));
             self.poll_sessions();
             self.sync_integrations();
+            let mut show = None;
             for cmd in self.bus.take() {
                 match cmd {
-                    Command::Show { token } => return Next::Show(token),
+                    Command::Show { token } => show = Some(token),
                     Command::Connect { target, token } => {
                         self.raise_for_prompt = Some(token);
                         self.connect_target(&target);
                     }
                     Command::Quit => {
-                        if let Err(e) = self.save_pending() {
-                            // Let the user decide about the edits that couldn't be saved.
-                            self.quit_save_error = Some(format!("{e:#}"));
+                        // Running sessions or unsaved edits: let the user decide.
+                        if self.prepare_quit() {
                             self.confirm_quit = true;
                             return Next::Show(None);
                         }
-                        self.terminate_all();
                         return Next::Quit;
                     }
                 }
             }
+            if let Some(token) = show {
+                return Next::Show(token);
+            }
             self.poll_keyring();
-            // A password prompt or a failed request needs the window.
-            if self.prompt.is_some() || self.errors != errors {
+            // A question for the user or a failed request needs the window.
+            if self.needs_window() || self.errors != errors {
                 return Next::Show(self.raise_for_prompt.take().flatten());
             }
-            if self.pending_lookups == 0 {
+            if self.pending_lookups.is_empty() {
                 self.raise_for_prompt = None;
             }
         }
@@ -519,6 +571,9 @@ impl App {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let modal_open = self.prompt.is_some()
             || self.confirm_delete.is_some()
+            || self.confirm_second.is_some()
+            || self.confirm_forget_cert.is_some()
+            || self.known_certs.is_some()
             || self.settings_draft.is_some()
             || self.confirm_quit;
         if modal_open {
@@ -542,7 +597,11 @@ impl App {
         if new {
             self.actions.push(Action::NewConnection);
         }
-        if save && (self.conn_dirty() || self.group_dirty()) {
+        let new_group = self
+            .group_draft
+            .as_ref()
+            .is_some_and(|g| g.new_from.is_some());
+        if save && (self.conn_dirty() || self.group_dirty() || new_group) {
             self.actions.push(Action::Save);
         }
         if find {
@@ -641,7 +700,9 @@ impl App {
 
     fn group_dirty(&self) -> bool {
         self.group_draft.as_ref().is_some_and(|g| {
-            g.group != g.original || !g.password.is_empty() || !g.gateway_password.is_empty()
+            g.group != *g.new_from.as_ref().unwrap_or(&g.original)
+                || !g.password.is_empty()
+                || !g.gateway_password.is_empty()
         })
     }
 
@@ -729,6 +790,10 @@ impl App {
         if new_name != old_name && self.config.group_names().contains(&new_name) {
             bail!("a group named “{new_name}” already exists");
         }
+        // Would share a keyring entry with the gateway password of the group without it.
+        if new_name != old_name && new_name.ends_with(":gateway") {
+            bail!("a group's name can't end in “:gateway”");
+        }
         g.group.name = new_name.clone();
 
         // Keyring changes for the old name, made once the config is saved.
@@ -799,6 +864,7 @@ impl App {
         self.config.groups.push(g.group.clone());
         self.config.groups.sort_by_key(|x| x.name.to_lowercase());
         g.original = g.group.clone();
+        g.new_from = None;
         for op in ops {
             self.keyring(op);
         }
@@ -809,8 +875,23 @@ impl App {
         Ok(())
     }
 
-    /// Saves the connection or group being edited, if it has changes.
+    /// Saves the connection or group being edited, if it has changes. A new connection
+    /// that has no host yet can't be saved, so it is dropped rather than blocking whatever
+    /// the user wants to do next.
     fn save_pending(&mut self) -> Result<()> {
+        if let Some(d) = self
+            .draft
+            .as_ref()
+            .filter(|d| d.is_new && d.conn.host.trim().is_empty())
+        {
+            let edited =
+                d.conn != d.pristine || !d.password.is_empty() || !d.gateway_password.is_empty();
+            self.draft = None;
+            if edited {
+                self.info("Discarded the new connection: it had no host");
+            }
+            return Ok(());
+        }
         if self.conn_dirty() {
             self.save_draft()
         } else if self.group_dirty() {
@@ -878,6 +959,7 @@ impl App {
                     let mut g = GroupDraft::new(&self.config, &name);
                     // Unsaved until the user hits Save.
                     g.original.name = String::new();
+                    g.new_from = Some(g.group.clone());
                     self.draft = None;
                     self.group_draft = Some(g);
                 }
@@ -916,7 +998,13 @@ impl App {
                 if let Some(d) = &self.draft {
                     self.draft = self.find(d.conn.id).cloned().map(|c| Draft::new(c, false));
                 }
-                if let Some(g) = &mut self.group_draft {
+                if self
+                    .group_draft
+                    .as_ref()
+                    .is_some_and(|g| g.new_from.is_some())
+                {
+                    self.group_draft = None;
+                } else if let Some(g) = &mut self.group_draft {
                     g.group = g.original.clone();
                     g.password.clear();
                     g.gateway_password.clear();
@@ -990,10 +1078,7 @@ impl App {
                     self.actions.push(Action::Forget(key));
                 }
             }
-            Action::ForgetCertificate(id) => match self.forget_certificate(id) {
-                Ok(msg) => self.info(msg),
-                Err(e) => self.error(e),
-            },
+            Action::ForgetCertificate(id, issue) => self.ask_forget_certificate(id, issue),
             Action::ToggleFavorite(id) => {
                 let drafts = self
                     .draft
@@ -1014,16 +1099,40 @@ impl App {
                 }
             }
             Action::Connect(id) => self.connect(id),
+            Action::ConnectAnyway(id) => {
+                self.confirm_second = None;
+                self.connect_anyway(id);
+            }
             Action::QuickConnect => {
                 let target = std::mem::take(&mut self.quick);
                 self.connect_target(&target);
             }
             Action::Launch => self.launch_from_prompt(),
             Action::OpenCertificates => self.known_certs = Some(self.load_certs()),
-            Action::ForgetKnownCert(path) => {
-                match certs::forget(&path) {
-                    Ok(()) => self.info(format!("Forgot {}", path.display())),
-                    Err(e) => self.error(e),
+            Action::AskForgetKnownCert {
+                host,
+                port,
+                path,
+                fingerprint,
+            } => {
+                self.confirm_forget_cert = Some(CertForget {
+                    host,
+                    port,
+                    path,
+                    old_fingerprint: Some(fingerprint).filter(|f| !f.is_empty()),
+                    new_fingerprint: None,
+                });
+            }
+            Action::ForgetCertConfirmed => {
+                if let Some(forget) = self.confirm_forget_cert.take() {
+                    match self.forget_cert(&forget) {
+                        Ok(()) => self.info(format!(
+                            "Forgot the certificate of {}:{}. The next connection will ask you \
+                             to check the new one.",
+                            forget.host, forget.port
+                        )),
+                        Err(e) => self.error(e),
+                    }
                 }
                 if self.known_certs.is_some() {
                     self.known_certs = Some(self.load_certs());
@@ -1092,9 +1201,11 @@ impl App {
         let (done, bus) = (self.keyring_done.clone(), self.bus.clone());
         self.keyring.run(move || {
             let failed = match op {
-                KeyringOp::Set(key, password) => {
-                    secrets::set(&key, &password).err().map(|e| (Some(key), e))
-                }
+                KeyringOp::Set(key, password) => secrets::set(&key, &password).err().map(|e| {
+                    // A password that was already saved stays usable if replacing it failed.
+                    let lost = !matches!(secrets::get(&key), Ok(Some(_)));
+                    (lost.then_some(key), e)
+                }),
                 KeyringOp::Delete(key) => secrets::delete(&key).err().map(|e| (None, e)),
                 KeyringOp::Move { from, to } => {
                     let copied = secrets::get(&from).and_then(|pw| match pw {
@@ -1115,20 +1226,58 @@ impl App {
         });
     }
 
-    /// Removes FreeRDP's trust-on-first-use record for a host so a changed certificate
-    /// can be accepted again.
-    fn forget_certificate(&self, id: Uuid) -> Result<String> {
-        let conn = self.find_any(id).context("connection no longer exists")?;
-        let file = certs::path_for(&conn.host, conn.port)?;
-        match std::fs::remove_file(&file) {
-            Ok(()) => Ok(format!(
-                "Forgot the saved certificate for {}. Connect again to review and trust the new one.",
-                conn.display_name()
-            )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(format!("No saved certificate found at {}", file.display()))
-            }
-            Err(e) => Err(e).with_context(|| format!("removing {}", file.display())),
+    /// Asks whether to forget the certificate FreeRDP refused. That names the host itself,
+    /// which behind a gateway may not be the connection's own.
+    fn ask_forget_certificate(&mut self, id: Uuid, issue: Option<CertIssue>) {
+        let (host, port, new_fingerprint) = match issue {
+            Some(i) => (i.host, i.port, i.new_fingerprint),
+            None => match self.find_any(id) {
+                Some(c) => (c.host.trim().to_string(), c.port, None),
+                None => return self.error(anyhow::anyhow!("connection no longer exists")),
+            },
+        };
+        let path = match certs::path_for(&host, port) {
+            Ok(p) => p,
+            Err(e) => return self.error(e),
+        };
+        if !path.exists() {
+            return self.info(format!("No saved certificate found at {}", path.display()));
+        }
+        self.confirm_forget_cert = Some(CertForget {
+            host,
+            port,
+            old_fingerprint: Some(certs::read(&path).fingerprint).filter(|f| !f.is_empty()),
+            new_fingerprint,
+            path,
+        });
+    }
+
+    /// Removes FreeRDP's record of a certificate, and remembers that the next one needs
+    /// checking: under trust on first use it would otherwise be accepted unseen. Checks
+    /// first that this can be remembered.
+    fn forget_cert(&mut self, forget: &CertForget) -> Result<()> {
+        self.ensure_writable()?;
+        certs::forget(&forget.path)?;
+        let review = CertReview {
+            host: certs::store_host(&forget.host),
+            port: forget.port,
+        };
+        if !self.config.cert_review.contains(&review) {
+            self.config.cert_review.push(review);
+        }
+        self.save_config()
+    }
+
+    /// Stops asking about servers whose new certificate FreeRDP has saved by now.
+    fn prune_cert_reviews(&mut self) {
+        let before = self.config.cert_review.len();
+        self.config
+            .cert_review
+            .retain(|r| !certs::path_for(&r.host, r.port).is_ok_and(|p| p.exists()));
+        if self.config.cert_review.len() != before
+            && let Err(e) = self.save_config()
+        {
+            self.error(e);
         }
     }
 
@@ -1195,7 +1344,26 @@ impl App {
         self.connect(id);
     }
 
+    /// Connects, first asking if the connection already has a session: a second sign-in
+    /// usually disconnects the first.
     fn connect(&mut self, id: Uuid) {
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.connection_id == id && s.is_running())
+        {
+            self.confirm_second = Some(id);
+        } else {
+            self.connect_anyway(id);
+        }
+    }
+
+    fn connect_anyway(&mut self, id: Uuid) {
+        // Clicking again while the keyring is being read isn't another connection.
+        if self.pending_lookups.contains(&id) {
+            return;
+        }
+        self.prune_cert_reviews();
         if self.draft.as_ref().is_some_and(|d| d.conn.id == id) && !self.commit() {
             return;
         }
@@ -1212,7 +1380,7 @@ impl App {
             return self.got_passwords(conn, Ok(None), Ok(None));
         }
         let (done, bus) = (self.keyring_done.clone(), self.bus.clone());
-        self.pending_lookups += 1;
+        self.pending_lookups.push(id);
         self.keyring.run(move || {
             let get = |key: Option<Key>| key.map_or(Ok(None), |k| secrets::get(&k));
             let lookup = Lookup {
@@ -1234,7 +1402,7 @@ impl App {
         for d in done {
             match d {
                 KeyringDone::Looked(l) => {
-                    self.pending_lookups -= 1;
+                    self.pending_lookups.retain(|id| *id != l.conn.id);
                     self.got_passwords(l.conn, l.password, l.gateway_password);
                 }
                 KeyringDone::Failed(key, e) => {
@@ -1535,7 +1703,7 @@ impl App {
                     // Behind a gateway the host itself is usually not reachable; check the gateway.
                     let (host, port) = match self.config.gateway(c) {
                         Some(gw) if !gw.host.is_empty() => model::split_host_port(&gw.host, 443),
-                        _ => (c.host.trim().to_string(), c.port),
+                        _ => (c.host.trim().trim_matches(['[', ']']).to_string(), c.port),
                     };
                     Target {
                         id: c.id,
@@ -1835,10 +2003,12 @@ impl App {
                 {
                     actions.push(Action::Save);
                 }
-                if ui
-                    .add_enabled(dirty && !d.is_new, egui::Button::new("↺ Revert"))
-                    .clicked()
-                {
+                let revert = if d.is_new {
+                    "✕ Discard"
+                } else {
+                    "↺ Revert"
+                };
+                if ui.add_enabled(dirty, egui::Button::new(revert)).clicked() {
                     actions.push(Action::Revert);
                 }
                 if ui
@@ -2193,6 +2363,7 @@ impl App {
         let Some(g) = self.group_draft.as_mut() else {
             return;
         };
+        let is_new = g.new_from.is_some();
         let actions = &mut self.actions;
         let saved = !g.original.name.is_empty() && self.config.group(&g.original.name).is_some();
         let members: Vec<&Connection> = self
@@ -2209,15 +2380,16 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(dirty, egui::Button::new("💾 Save"))
+                    .add_enabled(dirty || is_new, egui::Button::new("💾 Save"))
                     .on_hover_text("Ctrl+S")
                     .on_disabled_hover_text("No unsaved changes (Ctrl+S)")
                     .clicked()
                 {
                     actions.push(Action::Save);
                 }
+                let revert = if is_new { "✕ Discard" } else { "↺ Revert" };
                 if ui
-                    .add_enabled(dirty, egui::Button::new("↺ Revert"))
+                    .add_enabled(dirty || is_new, egui::Button::new(revert))
                     .clicked()
                 {
                     actions.push(Action::Revert);
@@ -2385,7 +2557,7 @@ impl App {
                         (Status::Running, None) => (
                             GREEN,
                             format!(
-                                "connected {:02}:{:02}:{:02}",
+                                "running {:02}:{:02}:{:02}",
                                 secs / 3600,
                                 secs / 60 % 60,
                                 secs % 60
@@ -2431,9 +2603,9 @@ impl App {
                                         Action::ForgetPassword(s.connection_id),
                                     )),
                                     Some(Fix::ForgetCertificate) => Some((
-                                        "Forget saved certificate",
+                                        "Forget saved certificate…",
                                         "Only if you expected the certificate to change",
-                                        Action::ForgetCertificate(s.connection_id),
+                                        Action::ForgetCertificate(s.connection_id, d.cert.clone()),
                                     )),
                                     None => None,
                                 };
@@ -2474,15 +2646,17 @@ impl App {
             }
             let s = &self.sessions[i];
             let out = s.output.lock().unwrap();
+            if out.lines.is_empty() {
+                ui.weak("(no output)");
+            }
+            // Only the visible lines are laid out; a log can run to thousands of them.
+            let row_height = ui.text_style_height(&egui::TextStyle::Small);
             egui::ScrollArea::both()
                 .id_salt("session_log")
                 .stick_to_bottom(true)
                 .auto_shrink(false)
-                .show(ui, |ui| {
-                    if out.lines.is_empty() {
-                        ui.weak("(no output)");
-                    }
-                    for line in out.lines.iter() {
+                .show_rows(ui, row_height, out.lines.len(), |ui, rows| {
+                    for line in &out.lines[rows] {
                         ui.add(egui::Label::new(RichText::new(line).monospace().small()).extend());
                     }
                 });
@@ -2665,7 +2839,7 @@ impl App {
                 ui.label(
                     "FreeRDP remembers each server's certificate the first time you accept it, and \
                      refuses to connect if it changes. Forget one when a server's certificate was \
-                     replaced on purpose.",
+                     replaced on purpose; the next connection then asks you to check the new one.",
                 );
                 ui.add_space(6.0);
                 if list.is_empty() {
@@ -2685,8 +2859,8 @@ impl App {
                                         .connections
                                         .iter()
                                         .filter(|c| {
-                                            c.host.trim().eq_ignore_ascii_case(&cert.host)
-                                                && c.port == cert.port
+                                            c.port == cert.port
+                                                && certs::store_host(&c.host) == cert.host
                                         })
                                         .map(|c| c.display_name())
                                         .collect();
@@ -2745,7 +2919,7 @@ impl App {
                                     if ui
                                         .button("Forget")
                                         .on_hover_text(
-                                            "You'll be asked to trust it again on the next connect",
+                                            "The next connection will ask you to check the new one",
                                         )
                                         .accessible_name(format!(
                                             "Forget certificate for {}",
@@ -2753,8 +2927,12 @@ impl App {
                                         ))
                                         .clicked()
                                     {
-                                        self.actions
-                                            .push(Action::ForgetKnownCert(cert.path.clone()));
+                                        self.actions.push(Action::AskForgetKnownCert {
+                                            host: cert.host.clone(),
+                                            port: cert.port,
+                                            path: cert.path.clone(),
+                                            fingerprint: cert.fingerprint.clone(),
+                                        });
                                     }
                                     ui.end_row();
                                 }
@@ -2775,6 +2953,94 @@ impl App {
             });
             if close || resp.should_close() {
                 self.known_certs = None;
+            }
+        }
+
+        if let Some(forget) = &self.confirm_forget_cert {
+            let mut close = false;
+            let asks = self.config.settings.client.contains("sdl");
+            let resp = egui::Modal::new(egui::Id::unique("confirm_forget_cert")).show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.heading("Forget this certificate?");
+                ui.label(format!("{}:{}", forget.host, forget.port));
+                ui.add_space(4.0);
+                ui.label(
+                    "Only do this if you expected the certificate to change, for example after \
+                     a renewal or reinstall. A change can also mean someone is intercepting the \
+                     connection.",
+                );
+                ui.add_space(6.0);
+                let fingerprint = |ui: &mut egui::Ui, label: &str, value: Option<&String>| {
+                    ui.label(label);
+                    match value {
+                        Some(v) => ui.label(RichText::new(v).monospace().small()),
+                        None => ui.weak("not known yet"),
+                    };
+                };
+                fingerprint(
+                    ui,
+                    "Saved certificate (SHA-256):",
+                    forget.old_fingerprint.as_ref(),
+                );
+                if forget.new_fingerprint.is_some() {
+                    fingerprint(
+                        ui,
+                        "Certificate the server presented (SHA-256):",
+                        forget.new_fingerprint.as_ref(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "The next connection will show you the new certificate and ask whether to \
+                     trust it.",
+                );
+                if !asks {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Only sdl-freerdp can show that question when started from xrdp-gui. \
+                         Other clients may refuse the connection instead; you can change the \
+                         client in Settings.",
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("Forget").color(ui.visuals().error_fg_color))
+                        .clicked()
+                    {
+                        self.actions.push(Action::ForgetCertConfirmed);
+                    }
+                    close = ui.button("Cancel").clicked();
+                });
+            });
+            if close || resp.should_close() {
+                self.confirm_forget_cert = None;
+            }
+        }
+
+        if let Some(id) = self.confirm_second {
+            let name = self
+                .find_any(id)
+                .map(|c| c.display_name().to_owned())
+                .unwrap_or_default();
+            let mut close = false;
+            let resp = egui::Modal::new(egui::Id::unique("confirm_second")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Already running");
+                ui.label(format!(
+                    "“{name}” already has a session running. Connecting again with the same \
+                     account usually disconnects it."
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Connect anyway").clicked() {
+                        self.actions.push(Action::ConnectAnyway(id));
+                    }
+                    close = ui.button("Cancel").clicked();
+                });
+            });
+            if close || resp.should_close() {
+                self.confirm_second = None;
             }
         }
 
@@ -2854,13 +3120,13 @@ impl App {
         self.handle_shortcuts(&ctx);
         self.handle_commands(&ctx);
         self.poll_keyring();
-        // A request from the tray or another launch that needs a password brings the
-        // window forward.
-        if self.prompt.is_some()
+        // A request from the tray or another launch that needs an answer brings the window
+        // forward.
+        if self.needs_window()
             && let Some(token) = self.raise_for_prompt.take()
         {
             self.bring_to_front(&ctx, token);
-        } else if self.pending_lookups == 0 {
+        } else if self.pending_lookups.is_empty() {
             self.raise_for_prompt = None;
         }
         self.sync_integrations();
@@ -2875,7 +3141,7 @@ impl App {
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.tray_active() {
-                self.exit = Exit::Hide;
+                self.hide_to_tray();
                 if !self.told_about_tray {
                     self.told_about_tray = true;
                     self.notify(
@@ -3212,6 +3478,7 @@ mod ui_tests {
                     notifications: false,
                     ..Default::default()
                 },
+                cert_review: Vec::new(),
                 groups: vec![Group {
                     name: "Work".into(),
                     domain: "CORP".into(),
@@ -3768,9 +4035,10 @@ mod ui_tests {
         let mut h = env.harness();
         let fake = h.state().config.settings.client.clone();
         // Three sessions; the middle one keeps running.
+        let alpha = h.state().config.connections[0].id;
         for client in [&fake, &slow.to_string_lossy().into_owned(), &fake] {
             h.state_mut().config.settings.client = client.clone();
-            h.state_mut().connect_target("Alpha");
+            h.state_mut().connect_anyway(alpha);
             h.state_mut().actions.push(Action::Launch);
             h.run_steps(2);
         }
@@ -3930,6 +4198,244 @@ mod ui_tests {
         h.get_by_label("Close").click();
         h.run_steps(3);
         assert!(h.state().known_certs.is_none());
+    }
+
+    /// Replaces the connection's client with one that runs until it is stopped.
+    fn use_slow_client(env: &TestEnv, h: &mut Harness<'static, App>) {
+        let slow = env.dir.join("slow-freerdp");
+        std::fs::write(&slow, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        h.state_mut().config.settings.client = slow.to_string_lossy().into_owned();
+    }
+
+    #[test]
+    fn new_connection_without_a_host_can_be_left() {
+        let env = TestEnv::new("leavenew");
+        let mut h = env.harness();
+        let alpha = h.state().config.connections[0].id;
+
+        // Untouched: dropped without comment.
+        h.state_mut().actions.push(Action::NewConnection);
+        h.run_steps(2);
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        assert_eq!(h.state().draft.as_ref().unwrap().conn.id, alpha);
+        assert!(h.state().notice.is_none());
+
+        // Edited: dropped, and says so.
+        h.state_mut().actions.push(Action::NewConnection);
+        h.run_steps(2);
+        h.state_mut().draft.as_mut().unwrap().conn.name = "Mine".into();
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        assert_eq!(h.state().draft.as_ref().unwrap().conn.id, alpha);
+        assert!(has_label(&h, "Discarded the new connection"));
+
+        // Discard works from the button, and quitting isn't held up by one either.
+        h.state_mut().actions.push(Action::NewConnection);
+        h.run_steps(3);
+        h.get_by_label("✕ Discard").click();
+        h.run_steps(3);
+        assert!(h.state().draft.is_none());
+        h.state_mut().actions.push(Action::NewConnection);
+        h.run_steps(2);
+        h.state_mut().actions.push(Action::AskQuit);
+        h.run_steps(2);
+        assert!(!h.state().confirm_quit);
+        assert_eq!(
+            Config::load(&env.config_path()).unwrap().connections.len(),
+            2
+        );
+
+        // With a host, leaving saves it as before.
+        h.state_mut().allow_close = false;
+        h.state_mut().actions.push(Action::NewConnection);
+        h.run_steps(2);
+        h.state_mut().draft.as_mut().unwrap().conn.host = "pc9".into();
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        assert_eq!(
+            Config::load(&env.config_path()).unwrap().connections.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn new_group_is_only_saved_if_touched() {
+        let env = TestEnv::new("leavegroup");
+        let mut h = env.harness();
+        let alpha = h.state().config.connections[0].id;
+        let groups = |env: &TestEnv| Config::load(&env.config_path()).unwrap().groups.len();
+
+        h.state_mut().actions.push(Action::NewGroup);
+        h.run_steps(2);
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        assert_eq!(groups(&env), 1, "an untouched new group isn't saved");
+
+        h.state_mut().actions.push(Action::NewGroup);
+        h.run_steps(3);
+        h.get_by_label("✕ Discard").click();
+        h.run_steps(3);
+        assert!(h.state().group_draft.is_none());
+
+        // Saving explicitly works even with nothing changed…
+        h.state_mut().actions.push(Action::NewGroup);
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, KeyCode::S);
+        h.run_steps(3);
+        assert_eq!(groups(&env), 2);
+
+        // …and a change is saved on leaving.
+        h.state_mut().actions.push(Action::NewGroup);
+        h.run_steps(2);
+        h.state_mut().group_draft.as_mut().unwrap().group.domain = "CORP".into();
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        assert_eq!(groups(&env), 3);
+
+        // Names that would share a keyring entry are refused.
+        h.state_mut().actions.push(Action::NewGroup);
+        h.run_steps(2);
+        h.state_mut().group_draft.as_mut().unwrap().group.name = "Work:gateway".into();
+        h.state_mut().actions.push(Action::Save);
+        h.run_steps(2);
+        assert_eq!(groups(&env), 3);
+        assert!(has_label(&h, "can't end in"));
+    }
+
+    #[test]
+    fn second_session_asks_first() {
+        let env = TestEnv::new("second");
+        let mut h = env.harness();
+        use_slow_client(&env, &mut h);
+        h.state_mut().connect_target("Alpha");
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(2);
+        assert_eq!(h.state().sessions.len(), 1);
+
+        h.state_mut().connect_target("Alpha");
+        h.run_steps(3);
+        assert!(
+            h.state().prompt.is_none(),
+            "doesn't get as far as a password"
+        );
+        assert!(has_label(&h, "already has a session running"));
+        h.get_by_label("Cancel").click();
+        h.run_steps(3);
+        assert!(h.state().confirm_second.is_none());
+        assert_eq!(h.state().sessions.len(), 1);
+
+        h.state_mut().connect_target("Alpha");
+        h.run_steps(3);
+        h.get_by_label("Connect anyway").click();
+        h.run_steps(3);
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(2);
+        assert_eq!(h.state().sessions.len(), 2);
+
+        // From the tray the question brings the window back.
+        let app = h.state_mut();
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Connect {
+            target: "Alpha".into(),
+            token: None,
+        });
+        assert!(matches!(app.run_hidden(), Next::Show(None)));
+        assert!(app.confirm_second.is_some());
+    }
+
+    #[test]
+    fn tray_quit_asks_about_running_sessions() {
+        let env = TestEnv::new("trayquit");
+        let mut h = env.harness();
+        use_slow_client(&env, &mut h);
+        h.state_mut().connect_target("Alpha");
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(2);
+
+        let app = h.state_mut();
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Quit);
+        assert!(matches!(app.run_hidden(), Next::Show(None)));
+        assert!(app.confirm_quit);
+        assert!(app.sessions[0].is_running(), "still connected");
+        h.run_steps(3);
+        assert!(has_label(&h, "1 session(s) are still running"));
+    }
+
+    #[test]
+    fn hidden_commands_are_all_handled() {
+        let env = TestEnv::new("hiddencmds");
+        let mut h = env.harness();
+        let app = h.state_mut();
+        app.exit = Exit::Hide;
+        app.bus.send(Command::Show { token: None });
+        app.bus.send(Command::Connect {
+            target: "Alpha".into(),
+            token: None,
+        });
+        assert!(matches!(app.run_hidden(), Next::Show(None)));
+        assert!(app.prompt.is_some(), "the request after Show isn't lost");
+
+        // Closing the window cancels the question rather than reopening for it.
+        app.hide_to_tray();
+        app.bus.send(Command::Quit);
+        assert!(matches!(app.run_hidden(), Next::Quit));
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn shortcuts_wait_for_the_certificate_window() {
+        let env = TestEnv::new("certmodal");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+        h.state_mut().actions.push(Action::OpenCertificates);
+        h.run_steps(3);
+        h.key_press(KeyCode::Delete);
+        h.run_steps(3);
+        assert!(h.state().confirm_delete.is_none());
+        h.key_press(KeyCode::Enter);
+        h.run_steps(3);
+        assert!(h.state().prompt.is_none());
+    }
+
+    #[test]
+    fn forgetting_a_certificate_confirms_and_then_asks() {
+        let env = TestEnv::new("forgetcert");
+        let mut h = env.harness();
+        let cert = env.dir.join("pc1_3389.pem");
+        std::fs::write(&cert, include_str!("../tests/data/test-cert.pem")).unwrap();
+        let fingerprint = certs::read(&cert).fingerprint;
+        h.state_mut().actions.push(Action::AskForgetKnownCert {
+            host: "PC1".into(),
+            port: 3389,
+            path: cert.clone(),
+            fingerprint: fingerprint.clone(),
+        });
+        h.run_steps(5);
+        assert!(has_label(&h, "Forget this certificate?"));
+        assert!(has_label(&h, &fingerprint), "shows what is being forgotten");
+        assert!(cert.exists(), "nothing happens before confirming");
+
+        h.get_by_label("Forget").click();
+        h.run_steps(3);
+        assert!(!cert.exists());
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert_eq!(
+            saved.cert_review,
+            [CertReview {
+                host: "pc1".into(),
+                port: 3389
+            }]
+        );
+
+        // The next connection to it doesn't use trust on first use, so FreeRDP asks.
+        let conn = Connection {
+            host: "pc1".into(),
+            ..Default::default()
+        };
+        assert_eq!(h.state().config.resolve(&conn).cert, CertPolicy::Ask);
     }
 
     #[test]

@@ -11,12 +11,15 @@ use chrono::{DateTime, Local};
 use uuid::Uuid;
 
 use crate::bus::Bus;
+use crate::certs;
 use crate::command;
 use crate::diagnose::{self, Diagnosis, Severity};
 
 const MAX_LOG_LINES: usize = 5000;
-/// With no new attempt for this long, a reconnecting session is assumed to be back.
-const RECONNECT_QUIET: Duration = Duration::from_secs(20);
+/// With no new attempt for this long, a reconnecting session is assumed to be back. FreeRDP
+/// doesn't log success. One attempt can outlast several connection timeouts when the network
+/// is gone, so this is generous: "Reconnected" comes late rather than wrongly.
+const RECONNECT_QUIET: Duration = Duration::from_secs(60);
 /// How long to wait after the client exits for its last output lines.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -127,8 +130,14 @@ impl Session {
         if out.open_streams > 0 && at.elapsed() < DRAIN_TIMEOUT {
             return false;
         }
-        let diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
+        let mut diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
         drop(out);
+        // FreeRDP logs the same warnings for a changed certificate and an unknown one.
+        if let Some(c) = &diagnosis.cert
+            && !certs::path_for(&c.host, c.port).is_ok_and(|p| p.exists())
+        {
+            diagnosis = diagnose::untrusted_certificate();
+        }
         self.status = Status::Exited(diagnosis);
         self.ended = Some(at);
         true

@@ -25,7 +25,7 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
         bail!("host is required");
     }
 
-    let mut args = vec![format!("/v:{host}")];
+    let mut args = vec![host_arg(host)];
     if conn.port != 3389 {
         args.push(format!("/port:{}", conn.port));
     }
@@ -174,6 +174,15 @@ fn gateway_arg(
     Ok(format!("/gateway:{}", parts.join(",")))
 }
 
+/// FreeRDP reads `/v:` up to the first ':' as the host, so an IPv6 address needs brackets.
+fn host_arg(host: &str) -> String {
+    if host.matches(':').count() >= 2 && !host.starts_with('[') {
+        format!("/v:[{host}]")
+    } else {
+        format!("/v:{host}")
+    }
+}
+
 fn push_nonempty(args: &mut Vec<String>, prefix: &str, value: &str) {
     let value = value.trim();
     if !value.is_empty() {
@@ -181,23 +190,41 @@ fn push_nonempty(args: &mut Vec<String>, prefix: &str, value: &str) {
     }
 }
 
-/// Replaces password values with `***` so arguments can be displayed or logged.
+/// Replaces passwords, hashes and tokens with `***` so arguments can be displayed or
+/// logged. Extra arguments are free-form, so this covers FreeRDP's options that take them.
 pub fn mask(arg: &str) -> String {
-    if arg.starts_with("/p:") {
-        return "/p:***".into();
+    for prefix in ["/p:", "/pth:", "/assistance:", "/endpointfedauth:"] {
+        if arg.starts_with(prefix) {
+            return format!("{prefix}***");
+        }
     }
-    if let Some(rest) = arg.strip_prefix("/gateway:") {
-        let parts: Vec<String> = rest
-            .split(',')
-            .map(|p| {
-                if p.starts_with("p:") {
-                    "p:***".into()
-                } else {
-                    p.to_string()
-                }
-            })
-            .collect();
-        return format!("/gateway:{}", parts.join(","));
+    // [<proto>://][<user>:<password>@]<host>[:<port>]
+    if let Some(rest) = arg.strip_prefix("/proxy:")
+        && let Some((credentials, host)) = rest.rsplit_once('@')
+    {
+        let (scheme, credentials) = match credentials.split_once("://") {
+            Some((scheme, rest)) => (format!("{scheme}://"), rest),
+            None => (String::new(), credentials),
+        };
+        let user = credentials.split(':').next().unwrap_or_default();
+        return format!("/proxy:{scheme}{user}:***@{host}");
+    }
+    for option in ["/gateway:", "/smartcard-logon:"] {
+        if let Some(rest) = arg.strip_prefix(option) {
+            let parts: Vec<String> = rest
+                .split(',')
+                .map(|part| {
+                    match ["p:", "access-token:", "bearer:", "pin:"]
+                        .into_iter()
+                        .find(|key| part.starts_with(key))
+                    {
+                        Some(key) => format!("{key}***"),
+                        None => part.to_string(),
+                    }
+                })
+                .collect();
+            return format!("{option}{}", parts.join(","));
+        }
     }
     arg.to_string()
 }
@@ -437,6 +464,48 @@ mod tests {
             args.contains(&"/gateway:g:gw.fb,u:gwuser,p:gwpw".into()),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn ipv6_hosts_get_brackets() {
+        let v = |host: &str| {
+            let c = Connection {
+                host: host.into(),
+                ..conn()
+            };
+            build(&c, &NO_CREDS).unwrap().remove(0)
+        };
+        assert_eq!(v("fe80::1"), "/v:[fe80::1]");
+        assert_eq!(v("[fe80::1]"), "/v:[fe80::1]");
+        assert_eq!(v("10.0.0.1"), "/v:10.0.0.1");
+        assert_eq!(v("pc1:3390"), "/v:pc1:3390");
+    }
+
+    #[test]
+    fn masks_every_kind_of_secret() {
+        for (arg, shown) in [
+            ("/p:hunter2", "/p:***"),
+            ("/pth:hunter2", "/pth:***"),
+            ("/assistance:hunter2", "/assistance:***"),
+            ("/endpointfedauth:hunter2", "/endpointfedauth:***"),
+            (
+                "/proxy:http://bob:hunter2@proxy:3128",
+                "/proxy:http://bob:***@proxy:3128",
+            ),
+            ("/proxy:bob:hunter2@proxy", "/proxy:bob:***@proxy"),
+            ("/proxy:http://proxy:3128", "/proxy:http://proxy:3128"),
+            (
+                "/gateway:g:gw,access-token:hunter2,bearer:hunter2",
+                "/gateway:g:gw,access-token:***,bearer:***",
+            ),
+            (
+                "/smartcard-logon:pin:hunter2,csp:x",
+                "/smartcard-logon:pin:***,csp:x",
+            ),
+            ("/size:1600x900", "/size:1600x900"),
+        ] {
+            assert_eq!(mask(arg), shown);
+        }
     }
 
     #[test]
