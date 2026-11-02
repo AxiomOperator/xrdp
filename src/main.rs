@@ -12,8 +12,17 @@ mod session;
 mod single_instance;
 mod tray;
 
+use std::sync::{PoisonError, RwLock};
+
 use bus::Command;
 use eframe::egui;
+
+/// Taken for writing while `main` hands egui-winit an activation token through the
+/// environment (egui-winit reads and clears it when it creates the window). Threads that
+/// read the environment from C, such as host-name lookups, take it for reading: glibc's
+/// `getenv` isn't safe against a concurrent `setenv`. Rust's own `std::env` is already
+/// locked internally.
+pub static ENV_LOCK: RwLock<()> = RwLock::new(());
 
 const USAGE: &str = "\
 Usage: xrdp-gui [--connect <target>]
@@ -96,15 +105,22 @@ fn main() -> eframe::Result {
 
     let mut app: Option<app::App> = None;
     loop {
+        let mut env_guard = None;
         if let Some(t) = token.take() {
+            let guard = ENV_LOCK.write().unwrap_or_else(PoisonError::into_inner);
             // egui-winit hands this to the new window so it may take focus.
-            // SAFETY: it's only read on this thread, when the window is created.
+            // SAFETY: other threads only read the environment through `std::env` (which
+            // serialises with this) or while holding ENV_LOCK, which we hold until the
+            // window exists and egui-winit has removed the variable again.
             unsafe { std::env::set_var("XDG_ACTIVATION_TOKEN", t) };
+            env_guard = Some(guard);
         }
         eframe::run_native(
             "xrdp-gui",
             options(),
             Box::new(|cc| {
+                // The window has been created by now.
+                drop(env_guard.take());
                 match &mut app {
                     Some(a) => a.attach(cc),
                     None => app = Some(app::App::new(cc, instance.take(), request.clone())),

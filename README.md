@@ -28,10 +28,15 @@ It stores your RDP connections and launches `sdl-freerdp` (or `xfreerdp`) for th
   "Wrong username or password" with a suggested fix and one-click remedies
   (forget saved password, forget a changed certificate)
 - **Desktop notifications** when a connection fails, drops, starts reconnecting, or comes back
-- Passwords stored in the desktop keyring (Secret Service: KWallet, GNOME Keyring)
+- Passwords stored in the desktop keyring (Secret Service: KWallet, GNOME Keyring); a
+  gateway with its own credentials gets its own password prompt
 - Arguments are passed to FreeRDP via `/args-from:stdin`, so passwords never show up in `ps`
 - Display options (window/fullscreen, size presets, multi-monitor, dynamic resolution)
-- Redirection (clipboard, home drive, audio, microphone), extra args
+- **Shared clipboard**: copy and paste text, images and files between the two computers, both
+  ways or in one direction only, set separately for text and files (one-way sharing uses
+  FreeRDP's `/clipboard:direction-to:…,files-to:…`, which older FreeRDP 3 releases lack;
+  3.32 has it). Pasting remote files locally needs FUSE.
+- Redirection (home drive, audio, microphone), extra args
 - Session list with live FreeRDP log output and disconnect; **copy or save a session's log**
   (with connection details, passwords masked) to send to support
 - Only one copy runs at a time; launching it again opens or brings forward the existing window

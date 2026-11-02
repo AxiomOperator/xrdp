@@ -46,6 +46,25 @@ fn rewrite(path: &PathBuf, favourites: &[(Uuid, String)]) -> Result<bool> {
     Ok(true)
 }
 
+/// The program of an `Exec=` value, still quoted if it was (a path with spaces).
+fn program(exec: &str) -> &str {
+    let exec = exec.trim_start();
+    let Some(rest) = exec.strip_prefix('"') else {
+        return exec.split_whitespace().next().unwrap_or("");
+    };
+    // Inside quotes, '\' escapes the next character.
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return &exec[..i + 2],
+            _ => {}
+        }
+    }
+    exec
+}
+
 /// `text` with its actions replaced by one "connect" action per favourite.
 fn with_actions(text: &str, favourites: &[(Uuid, String)]) -> String {
     // Keep only the main group, minus any previous Actions= line.
@@ -57,7 +76,8 @@ fn with_actions(text: &str, favourites: &[(Uuid, String)]) -> String {
     let exec = main
         .iter()
         .find_map(|l| l.strip_prefix("Exec="))
-        .and_then(|e| e.split_whitespace().next())
+        .map(program)
+        .filter(|p| !p.is_empty())
         .unwrap_or("xrdp-gui");
 
     let mut out = main.join("\n").trim_end().to_string();
@@ -110,5 +130,20 @@ mod tests {
             two
         );
         assert_eq!(with_actions(&two, &[]), INSTALLED);
+    }
+
+    #[test]
+    fn quoted_program_path() {
+        let installed = "[Desktop Entry]\nExec=\"/home/u/my apps/xrdp-gui\"\n";
+        let id = Uuid::from_u128(1);
+        let out = with_actions(installed, &[(id, "Lab".into())]);
+        assert!(
+            out.contains(&format!(
+                "Exec=\"/home/u/my apps/xrdp-gui\" --connect {id}\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(program(r#""a \" b" --x"#), r#""a \" b""#);
+        assert_eq!(program("plain --x"), "plain");
     }
 }

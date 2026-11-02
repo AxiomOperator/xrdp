@@ -77,6 +77,11 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
+# The menu entry quotes the binary's path, so spaces are fine; these would need escaping.
+case "$BIN" in
+    *[\"\`\$\\]*) echo "PREFIX may not contain \", \`, \$ or \\" >&2; exit 1 ;;
+esac
+
 cd "$(dirname "$0")"
 PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found; install Rust from https://rustup.rs" >&2; exit 1; }
@@ -86,9 +91,16 @@ cargo build --release --locked
 install -Dm755 target/release/xrdp-gui "$BIN"
 install -Dm644 assets/xrdp-gui.svg "$ICON"
 mkdir -p "$(dirname "$DESKTOP")"
-# Use an absolute path: the desktop session's PATH may not include ~/.local/bin.
+# Use an absolute path: the desktop session's PATH may not include ~/.local/bin. In Exec=,
+# a literal '%' is written '%%'.
+exec_path=$(printf '%s' "$BIN" | sed 's/%/%%/g')
 for f in xrdp-gui xrdp-gui-session; do
-    sed "s|^Exec=.*|Exec=$BIN|" "assets/$f.desktop" > "$PREFIX/share/applications/$f.desktop"
+    while IFS= read -r line; do
+        case $line in
+            Exec=*) printf 'Exec="%s"\n' "$exec_path" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "assets/$f.desktop" > "$PREFIX/share/applications/$f.desktop"
 done
 chmod 644 "$DESKTOP" "$SESSION_DESKTOP"
 add_kwin_rule

@@ -386,6 +386,13 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
         };
     }
 
+    // After a reconnect, only what was logged since the last attempt says how the session
+    // ended: errors from the drop before it, or from failed attempts, were recovered from.
+    let start = log
+        .iter()
+        .rposition(|l| reconnect_attempt(l).is_some())
+        .map_or(0, |i| i + 1);
+    let log = &log[start..];
     let codes: Vec<&str> = log
         .iter()
         .flat_map(|l| codes_in(l))
@@ -412,7 +419,10 @@ pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diag
             fix: None,
             code: None,
         },
-        Some(128) => Diagnosis {
+        // FreeRDP's command-line parser fails with winpr's COMMAND_LINE_ERROR codes,
+        // -1000 to -1006 (an unknown option is -1000, a bad value -1002), which the exit
+        // status truncates to a byte: 24 down to 18.
+        Some(128 | 18..=24) => Diagnosis {
             title: "FreeRDP rejected the options".into(),
             hint: "One of the arguments isn't valid for this FreeRDP version — check the extra arguments.".into(),
             severity: Failed,
@@ -523,5 +533,24 @@ mod tests {
         assert_eq!(reconnect_attempt("nothing"), None);
         let log = lines(&[line, "[ERROR] AutoReconnect retries exceeded."]);
         assert_eq!(diagnose(&log, exit(131), false).title, "Connection lost");
+
+        // Rejected arguments, as FreeRDP 3.32 reports them.
+        for code in [24, 22] {
+            assert_eq!(
+                diagnose(&[], exit(code), false).title,
+                "FreeRDP rejected the options"
+            );
+        }
+
+        // A drop that was recovered from doesn't count against the session.
+        let log = lines(&[
+            "[ERROR][com.freerdp.core] - [transport]: ERRCONNECT_CONNECT_TRANSPORT_FAILED [0x0002000D]",
+            "[INFO][com.freerdp.client.common] - [client_auto_reconnect_ex]: Attempting reconnect (1 of 10)",
+            "[ERROR][com.freerdp.core] - [transport]: ERRCONNECT_CONNECT_TRANSPORT_FAILED [0x0002000D]",
+            line,
+            "[INFO][com.freerdp.client.sdl] - window closed",
+        ]);
+        let d = diagnose(&log, exit(0), false);
+        assert_eq!((d.title.as_str(), d.severity), ("Session ended", Normal));
     }
 }

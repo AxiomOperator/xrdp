@@ -128,6 +128,42 @@ pub fn set_screen_scale(pixels_per_point: f32) {
     SCREEN_SCALE.store(percent, Ordering::Relaxed);
 }
 
+/// Which way the shared clipboard lets something be copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipboardShare {
+    #[default]
+    Both,
+    /// From this computer to the remote one only.
+    ToRemote,
+    /// From the remote computer to this one only.
+    ToLocal,
+    Off,
+}
+
+impl ClipboardShare {
+    pub const ALL: [ClipboardShare; 4] = [Self::Both, Self::ToRemote, Self::ToLocal, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "Both ways",
+            Self::ToRemote => "Only to the remote computer",
+            Self::ToLocal => "Only from the remote computer",
+            Self::Off => "Off",
+        }
+    }
+
+    /// FreeRDP's name for the direction (`/clipboard:direction-to:…`).
+    pub fn freerdp(self) -> &'static str {
+        match self {
+            Self::Both => "all",
+            Self::ToRemote => "remote",
+            Self::ToLocal => "local",
+            Self::Off => "off",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GatewayMode {
@@ -166,7 +202,12 @@ pub struct Connection {
     /// 0 means unlimited.
     pub reconnect_retries: u32,
 
-    pub clipboard: bool,
+    /// Older configs stored a plain on/off flag; migrated on load.
+    #[serde(skip_serializing)]
+    pub clipboard: Option<bool>,
+    /// Text and images.
+    pub clipboard_text: ClipboardShare,
+    pub clipboard_files: ClipboardShare,
     pub home_drive: bool,
     pub sound: bool,
     pub microphone: bool,
@@ -213,7 +254,9 @@ impl Default for Connection {
             profile: None,
             auto_reconnect: true,
             reconnect_retries: 10,
-            clipboard: true,
+            clipboard: None,
+            clipboard_text: ClipboardShare::Both,
+            clipboard_files: ClipboardShare::Both,
             home_drive: false,
             sound: true,
             microphone: false,
@@ -424,6 +467,10 @@ impl Config {
                 Some(false) => c.gateway = GatewayMode::Inherit,
                 None => {}
             }
+            if c.clipboard.take() == Some(false) {
+                c.clipboard_text = ClipboardShare::Off;
+                c.clipboard_files = ClipboardShare::Off;
+            }
         }
     }
 
@@ -444,7 +491,8 @@ impl Config {
             .chain(self.connections.iter().map(|c| c.group.trim().to_string()))
             .filter(|n| !n.is_empty())
             .collect();
-        names.sort_by_key(|n| n.to_lowercase());
+        // Ties broken by exact name, so duplicates end up next to each other for dedup.
+        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then(a.cmp(b)));
         names.dedup();
         names
     }
@@ -476,7 +524,29 @@ impl Config {
                 .unwrap_or_default(),
             d => d.to_string(),
         };
-        let gateway = match conn.gateway {
+        Resolved {
+            conn: conn.clone(),
+            username,
+            domain,
+            password_key,
+            creds_from_group: creds_group.map(|g| g.name.clone()),
+            scale: conn.scaling.percent(),
+            cert: conn
+                .cert
+                .or(group.and_then(|g| g.cert))
+                .unwrap_or(CertPolicy::DEFAULT),
+            profile: conn
+                .profile
+                .or(group.and_then(|g| g.profile))
+                .unwrap_or(Profile::DEFAULT),
+            gateway: self.gateway(conn),
+        }
+    }
+
+    /// The gateway `conn` connects through, after inheritance.
+    pub fn gateway(&self, conn: &Connection) -> Option<GatewayTarget> {
+        let group = self.group(&conn.group);
+        match conn.gateway {
             GatewayMode::Off => None,
             GatewayMode::On => Some(GatewayTarget {
                 host: conn.gateway_host.trim().to_string(),
@@ -498,23 +568,6 @@ impl Config {
                     .then(|| Key::GroupGateway(g.name.clone())),
                 from_group: Some(g.name.clone()),
             }),
-        };
-        Resolved {
-            conn: conn.clone(),
-            username,
-            domain,
-            password_key,
-            creds_from_group: creds_group.map(|g| g.name.clone()),
-            scale: conn.scaling.percent(),
-            cert: conn
-                .cert
-                .or(group.and_then(|g| g.cert))
-                .unwrap_or(CertPolicy::DEFAULT),
-            profile: conn
-                .profile
-                .or(group.and_then(|g| g.profile))
-                .unwrap_or(Profile::DEFAULT),
-            gateway,
         }
     }
 }
@@ -614,6 +667,7 @@ mod tests {
             name = "b"
             host = "h"
             gateway_enabled = false
+            clipboard = false
         "#;
         let mut config: Config = toml::from_str(old).unwrap();
         config.migrate();
@@ -621,11 +675,13 @@ mod tests {
         assert_eq!(config.connections[0].cert, Some(CertPolicy::Tofu));
         assert_eq!(config.connections[1].gateway, GatewayMode::Inherit);
         assert!(config.connections[1].auto_reconnect);
-        assert!(
-            !toml::to_string(&config)
-                .unwrap()
-                .contains("gateway_enabled")
-        );
+        assert_eq!(config.connections[0].clipboard_text, ClipboardShare::Both);
+        assert_eq!(config.connections[1].clipboard_text, ClipboardShare::Off);
+        assert_eq!(config.connections[1].clipboard_files, ClipboardShare::Off);
+        let saved = toml::to_string(&config).unwrap();
+        assert!(!saved.contains("gateway_enabled"));
+        assert!(!saved.contains("clipboard ="), "{saved}");
+        assert!(saved.contains("clipboard_files = \"off\""), "{saved}");
     }
 
     #[test]
@@ -703,6 +759,23 @@ mod tests {
         }
         assert_eq!(Scaling::Percent(175).percent(), Some(175));
         assert_eq!(Scaling::Off.percent(), None);
+    }
+
+    #[test]
+    fn group_names_are_unique() {
+        let conn = |group: &str| Connection {
+            group: group.into(),
+            ..Default::default()
+        };
+        let config = Config {
+            groups: vec![Group {
+                name: "Work".into(),
+                ..Default::default()
+            }],
+            connections: vec![conn("Work"), conn("work"), conn(" Work "), conn("")],
+            ..Default::default()
+        };
+        assert_eq!(config.group_names(), ["Work", "work"]);
     }
 
     #[test]

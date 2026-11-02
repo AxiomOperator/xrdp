@@ -1,9 +1,9 @@
 //! Background reachability checks for each connection's RDP (or gateway) port.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,31 +38,41 @@ impl Prober {
         let results: Arc<Mutex<HashMap<Uuid, (Target, Reach)>>> = Arc::default();
         let shared = results.clone();
         thread::spawn(move || {
-            let mut targets = Vec::new();
+            let targets: Arc<Mutex<Vec<Target>>> = Arc::default();
+            let in_flight: Arc<Mutex<HashSet<Target>>> = Arc::default();
             loop {
                 match rx.recv_timeout(INTERVAL) {
                     Ok(new) => {
-                        targets = new;
-                        shared
-                            .lock()
-                            .unwrap()
-                            .retain(|_, (t, _)| targets.contains(t));
+                        shared.lock().unwrap().retain(|_, (t, _)| new.contains(t));
+                        *targets.lock().unwrap() = new;
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
-                // Probe in parallel so one slow host doesn't delay the rest.
-                let handles: Vec<_> = targets
-                    .iter()
-                    .cloned()
-                    .map(|t| thread::spawn(move || (check(&t.host, t.port), t)))
-                    .collect();
-                for h in handles {
-                    if let Ok((reach, t)) = h.join() {
-                        shared.lock().unwrap().insert(t.id, (t, reach));
+                // Probe in parallel and report each host as soon as it answers, so one
+                // slow host doesn't delay the rest. A host still being checked from last
+                // time (a hanging name lookup, say) is skipped rather than piling up.
+                let current = targets.lock().unwrap().clone();
+                for t in current {
+                    if !in_flight.lock().unwrap().insert(t.clone()) {
+                        continue;
                     }
+                    let (targets, in_flight, shared, bus) = (
+                        targets.clone(),
+                        in_flight.clone(),
+                        shared.clone(),
+                        bus.clone(),
+                    );
+                    thread::spawn(move || {
+                        let reach = check(&t.host, t.port);
+                        // Results for hosts that were edited meanwhile are stale.
+                        if targets.lock().unwrap().contains(&t) {
+                            shared.lock().unwrap().insert(t.id, (t.clone(), reach));
+                            bus.wake();
+                        }
+                        in_flight.lock().unwrap().remove(&t);
+                    });
                 }
-                bus.wake();
             }
         });
         Self {
@@ -89,7 +99,14 @@ impl Prober {
 }
 
 fn check(host: &str, port: u16) -> Reach {
-    let addrs = match (host, port).to_socket_addrs() {
+    let lookup = {
+        // getaddrinfo reads the environment; see `ENV_LOCK`.
+        let _env = crate::ENV_LOCK
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        (host, port).to_socket_addrs()
+    };
+    let addrs = match lookup {
         Ok(a) => a.collect::<Vec<_>>(),
         Err(_) => return Reach::Down("host name not found".into()),
     };

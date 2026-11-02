@@ -3,7 +3,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::model::{CertPolicy, GatewayTarget, Resolved, Settings};
+use crate::model::{CertPolicy, ClipboardShare, GatewayTarget, Resolved, Settings};
 
 /// Window class / app id for session windows. It matches `xrdp-gui-session.desktop`, so
 /// the desktop shows our icon on them, while keeping them apart from the main window
@@ -69,8 +69,15 @@ pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Res
         ));
     }
 
-    if !conn.clipboard {
-        args.push("-clipboard".into());
+    match (conn.clipboard_text, conn.clipboard_files) {
+        (ClipboardShare::Off, ClipboardShare::Off) => args.push("-clipboard".into()),
+        // FreeRDP's default.
+        (ClipboardShare::Both, ClipboardShare::Both) => {}
+        (text, files) => args.push(format!(
+            "/clipboard:direction-to:{},files-to:{}",
+            text.freerdp(),
+            files.freerdp()
+        )),
     }
     if conn.home_drive {
         args.push("+home-drive".into());
@@ -131,7 +138,7 @@ fn gateway_arg(
         }
     }
     let (user, domain, password) = if gw.same_credentials {
-        (username.trim(), domain, creds.password)
+        (username.trim(), domain.trim(), creds.password)
     } else {
         (
             gw.username.as_str(),
@@ -311,7 +318,8 @@ mod tests {
             fullscreen: true,
             multimon: true,
             dynamic_resolution: false,
-            clipboard: false,
+            clipboard_text: ClipboardShare::Off,
+            clipboard_files: ClipboardShare::Off,
             extra_args: r#"/drive:"My Docs",/tmp +admin"#.into(),
             ..conn()
         };
@@ -322,6 +330,36 @@ mod tests {
         assert!(args.contains(&"-clipboard".into()));
         assert!(!args.iter().any(|a| a.starts_with("/size")));
         assert!(args.ends_with(&["/drive:My Docs,/tmp".into(), "+admin".into()]));
+    }
+
+    #[test]
+    fn shared_clipboard() {
+        let clip = |clipboard_text, clipboard_files| {
+            let c = Connection {
+                clipboard_text,
+                clipboard_files,
+                ..conn()
+            };
+            build(&c, &NO_CREDS)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.contains("clipboard"))
+                .collect::<Vec<_>>()
+        };
+        use ClipboardShare::*;
+        assert!(
+            clip(Both, Both).is_empty(),
+            "FreeRDP shares both ways by default"
+        );
+        assert_eq!(clip(Off, Off), ["-clipboard"]);
+        assert_eq!(
+            clip(Both, Off),
+            ["/clipboard:direction-to:all,files-to:off"]
+        );
+        assert_eq!(
+            clip(ToRemote, ToLocal),
+            ["/clipboard:direction-to:remote,files-to:local"]
+        );
     }
 
     #[test]

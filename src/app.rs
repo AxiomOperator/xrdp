@@ -14,7 +14,8 @@ use crate::command::{self, Credentials};
 use crate::desktop;
 use crate::diagnose::{Fix, Severity};
 use crate::model::{
-    self, CertPolicy, Config, Connection, GatewayMode, Group, Profile, Resolved, Scaling, Settings,
+    self, CertPolicy, ClipboardShare, Config, Connection, GatewayMode, Group, Profile, Resolved,
+    Scaling, Settings,
 };
 use crate::notify;
 use crate::probe::{Prober, Reach, Target};
@@ -109,15 +110,56 @@ impl GroupDraft {
     }
 }
 
+/// Asks for whichever passwords a connection needs that aren't in the keyring.
 struct PasswordPrompt {
     /// A copy, so quick connections (which aren't saved) work too.
     conn: Connection,
     target: String,
+    /// The password from the keyring, when only the gateway password is missing.
+    saved_password: Option<String>,
     password: String,
     /// Where "Save in keyring" stores the password and what to call it; `None` for
     /// quick connections.
     save_to: Option<(Key, String)>,
     remember: bool,
+    /// Set when a gateway with its own credentials has no saved password.
+    gateway: Option<GatewayPrompt>,
+    /// The gateway password from the keyring, if it has one.
+    saved_gateway_password: Option<String>,
+    /// Whether the first field has been given keyboard focus.
+    focused: bool,
+}
+
+struct GatewayPrompt {
+    target: String,
+    password: String,
+    save_to: Option<(Key, String)>,
+    remember: bool,
+}
+
+/// Passwords read from the keyring for a connection about to be launched.
+struct Lookup {
+    conn: Connection,
+    password: Result<Option<String>>,
+    gateway_password: Result<Option<String>>,
+}
+
+/// A change to the keyring, run in the background by [`App::keyring`].
+enum KeyringOp {
+    Set(Key, String),
+    Delete(Key),
+    /// Moves a password to a new entry (a group was renamed).
+    Move {
+        from: Key,
+        to: Key,
+    },
+}
+
+/// Results of keyring work, handed back to the UI thread.
+enum KeyringDone {
+    Looked(Box<Lookup>),
+    /// `key`, if any, ended up without a password even though the config says it has one.
+    Failed(Option<Key>, anyhow::Error),
 }
 
 /// What happens when the window closes.
@@ -179,6 +221,8 @@ pub struct App {
     confirm_delete: Option<Uuid>,
     settings_draft: Option<Settings>,
     confirm_quit: bool,
+    /// Why pending edits couldn't be saved on quit; shown in the quit dialog.
+    quit_save_error: Option<String>,
     allow_close: bool,
     notice: Option<(String, bool)>,
     prober: Prober,
@@ -189,6 +233,20 @@ pub struct App {
     bus: Bus,
     /// Notices from background work (e.g. saving a log file).
     inbox: Arc<Mutex<Vec<(String, bool)>>>,
+    /// Runs keyring work off the UI thread, in order.
+    keyring: secrets::Queue,
+    /// Finished keyring work, waiting to be handled on the UI thread.
+    keyring_done: Arc<Mutex<Vec<KeyringDone>>>,
+    pending_lookups: usize,
+    /// Set by a request from the tray or another launch: the activation token to bring
+    /// the window forward with if that request ends up asking for a password.
+    raise_for_prompt: Option<Option<String>>,
+    /// Counts errors shown, so the tray can tell whether a request failed.
+    errors: u64,
+    /// Bumped whenever the config changes (every change goes through `save_config`).
+    config_version: std::cell::Cell<u64>,
+    /// The config version the host checks were last set up for.
+    probed_version: Option<u64>,
     /// Text of the quick-connect box.
     quick: String,
     /// Quick connections made this run; not saved.
@@ -254,6 +312,7 @@ impl App {
             confirm_delete: None,
             settings_draft: None,
             confirm_quit: false,
+            quit_save_error: None,
             allow_close: false,
             notice,
             prober: Prober::new(bus.clone()),
@@ -261,6 +320,13 @@ impl App {
             _instance: instance,
             bus,
             inbox: Arc::default(),
+            keyring: secrets::Queue::new(),
+            keyring_done: Arc::default(),
+            pending_lookups: 0,
+            raise_for_prompt: None,
+            errors: 0,
+            config_version: std::cell::Cell::new(0),
+            probed_version: None,
             quick: String::new(),
             adhoc: Vec::new(),
             known_certs: None,
@@ -298,6 +364,7 @@ impl App {
             Exit::Reopen(token) => return Next::Show(token),
             Exit::Hide => {}
         }
+        let errors = self.errors;
         loop {
             self.bus.wait(Duration::from_millis(500));
             self.poll_sessions();
@@ -306,17 +373,28 @@ impl App {
                 match cmd {
                     Command::Show { token } => return Next::Show(token),
                     Command::Connect { target, token } => {
+                        self.raise_for_prompt = Some(token);
                         self.connect_target(&target);
-                        // A password prompt or an error needs the window.
-                        if self.prompt.is_some() || self.notice.as_ref().is_some_and(|n| n.1) {
-                            return Next::Show(token);
-                        }
                     }
                     Command::Quit => {
+                        if let Err(e) = self.save_pending() {
+                            // Let the user decide about the edits that couldn't be saved.
+                            self.quit_save_error = Some(format!("{e:#}"));
+                            self.confirm_quit = true;
+                            return Next::Show(None);
+                        }
                         self.terminate_all();
                         return Next::Quit;
                     }
                 }
+            }
+            self.poll_keyring();
+            // A password prompt or a failed request needs the window.
+            if self.prompt.is_some() || self.errors != errors {
+                return Next::Show(self.raise_for_prompt.take().flatten());
+            }
+            if self.pending_lookups == 0 {
+                self.raise_for_prompt = None;
             }
         }
     }
@@ -404,10 +482,8 @@ impl App {
             match cmd {
                 Command::Show { token } => self.bring_to_front(ctx, token),
                 Command::Connect { target, token } => {
+                    self.raise_for_prompt = Some(token);
                     self.connect_target(&target);
-                    if self.prompt.is_some() {
-                        self.bring_to_front(ctx, token);
-                    }
                 }
                 Command::Quit => self.actions.push(Action::AskQuit),
             }
@@ -575,6 +651,7 @@ impl App {
 
     fn error(&mut self, e: anyhow::Error) {
         self.notice = Some((format!("{e:#}"), true));
+        self.errors += 1;
     }
 
     fn notify(&self, summary: String, body: String, urgent: bool) {
@@ -583,14 +660,24 @@ impl App {
         }
     }
 
-    fn save_config(&self) -> Result<()> {
+    /// Fails if the config can't be saved, so changes that also touch the keyring can
+    /// check before they start.
+    fn ensure_writable(&self) -> Result<()> {
         if let Some(e) = &self.load_error {
             bail!("not saving: config failed to load ({e})");
         }
+        Ok(())
+    }
+
+    fn save_config(&self) -> Result<()> {
+        // The in-memory config changed even if it can't be written.
+        self.config_version.set(self.config_version.get() + 1);
+        self.ensure_writable()?;
         self.config.save(&self.config_path)
     }
 
     fn save_draft(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         let Some(d) = self.draft.as_mut() else {
             return Ok(());
         };
@@ -598,15 +685,20 @@ impl App {
             bail!("host is required");
         }
         d.conn.group = d.conn.group.trim().to_string();
+        let mut ops = Vec::new();
         if !d.password.is_empty() {
-            secrets::set(&Key::Rdp(d.conn.id), &d.password)?;
+            ops.push(KeyringOp::Set(
+                Key::Rdp(d.conn.id),
+                std::mem::take(&mut d.password),
+            ));
             d.conn.has_saved_password = true;
-            d.password.clear();
         }
         if !d.gateway_password.is_empty() {
-            secrets::set(&Key::Gateway(d.conn.id), &d.gateway_password)?;
+            ops.push(KeyringOp::Set(
+                Key::Gateway(d.conn.id),
+                std::mem::take(&mut d.gateway_password),
+            ));
             d.conn.has_saved_gateway_password = true;
-            d.gateway_password.clear();
         }
         match self
             .config
@@ -618,10 +710,14 @@ impl App {
             None => self.config.connections.push(d.conn.clone()),
         }
         d.is_new = false;
+        for op in ops {
+            self.keyring(op);
+        }
         self.save_config()
     }
 
     fn save_group(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         let Some(g) = self.group_draft.as_mut() else {
             return Ok(());
         };
@@ -635,28 +731,35 @@ impl App {
         }
         g.group.name = new_name.clone();
 
+        // Keyring changes for the old name, made once the config is saved.
+        let mut after_save = Vec::new();
         // A brand-new group has no old name; don't sweep ungrouped connections into it.
         if new_name != old_name && !old_name.is_empty() {
-            // Saved passwords are keyed by group name; move them along.
+            // Saved passwords are keyed by group name; copy them along unless a new one
+            // was typed.
             let moves = [
                 (
-                    g.original.has_saved_password && g.password.is_empty(),
+                    g.original.has_saved_password,
+                    g.password.is_empty(),
                     Key::GroupRdp(old_name.clone()),
                     Key::GroupRdp(new_name.clone()),
                 ),
                 (
-                    g.original.has_saved_gateway_password && g.gateway_password.is_empty(),
+                    g.original.has_saved_gateway_password,
+                    g.gateway_password.is_empty(),
                     Key::GroupGateway(old_name.clone()),
                     Key::GroupGateway(new_name.clone()),
                 ),
             ];
-            for (needed, old_key, new_key) in moves {
-                if needed {
-                    if let Some(pw) = secrets::get(&old_key)? {
-                        secrets::set(&new_key, &pw)?;
-                    }
-                    secrets::delete(&old_key)?;
-                }
+            for (saved, keep, old_key, new_key) in moves {
+                after_save.push(match (saved, keep) {
+                    (false, _) => continue,
+                    (true, true) => KeyringOp::Move {
+                        from: old_key,
+                        to: new_key,
+                    },
+                    (true, false) => KeyringOp::Delete(old_key),
+                });
             }
             for c in self
                 .config
@@ -674,15 +777,20 @@ impl App {
                 d.conn.group = new_name.clone();
             }
         }
+        let mut ops = Vec::new();
         if !g.password.is_empty() {
-            secrets::set(&Key::GroupRdp(new_name.clone()), &g.password)?;
+            ops.push(KeyringOp::Set(
+                Key::GroupRdp(new_name.clone()),
+                std::mem::take(&mut g.password),
+            ));
             g.group.has_saved_password = true;
-            g.password.clear();
         }
         if !g.gateway_password.is_empty() {
-            secrets::set(&Key::GroupGateway(new_name.clone()), &g.gateway_password)?;
+            ops.push(KeyringOp::Set(
+                Key::GroupGateway(new_name.clone()),
+                std::mem::take(&mut g.gateway_password),
+            ));
             g.group.has_saved_gateway_password = true;
-            g.gateway_password.clear();
         }
 
         self.config
@@ -691,25 +799,43 @@ impl App {
         self.config.groups.push(g.group.clone());
         self.config.groups.sort_by_key(|x| x.name.to_lowercase());
         g.original = g.group.clone();
-        self.save_config()
+        for op in ops {
+            self.keyring(op);
+        }
+        self.save_config()?;
+        for op in after_save {
+            self.keyring(op);
+        }
+        Ok(())
     }
 
-    /// Saves pending edits before navigating away; returns false if that failed.
-    fn commit(&mut self) -> bool {
-        let result = if self.conn_dirty() {
+    /// Saves the connection or group being edited, if it has changes.
+    fn save_pending(&mut self) -> Result<()> {
+        if self.conn_dirty() {
             self.save_draft()
         } else if self.group_dirty() {
             self.save_group()
         } else {
             Ok(())
-        };
-        match result {
+        }
+    }
+
+    /// Saves pending edits before navigating away; returns false if that failed.
+    fn commit(&mut self) -> bool {
+        match self.save_pending() {
             Ok(()) => true,
             Err(e) => {
                 self.error(e.context("unsaved changes"));
                 false
             }
         }
+    }
+
+    /// Saves pending edits; returns whether quitting needs confirming because sessions
+    /// are running or the edits couldn't be saved.
+    fn prepare_quit(&mut self) -> bool {
+        self.quit_save_error = self.save_pending().err().map(|e| format!("{e:#}"));
+        self.quit_save_error.is_some() || self.sessions.iter().any(Session::is_running)
     }
 
     fn current_group(&self) -> String {
@@ -817,29 +943,37 @@ impl App {
             Action::AskDelete(id) => self.confirm_delete = Some(id),
             Action::Delete(id) => {
                 self.confirm_delete = None;
+                if let Err(e) = self.ensure_writable() {
+                    return self.error(e);
+                }
                 self.config.connections.retain(|c| c.id != id);
                 if self.draft.as_ref().is_some_and(|d| d.conn.id == id) {
                     self.draft = None;
                 }
-                let result = secrets::delete(&Key::Rdp(id))
-                    .and_then(|()| secrets::delete(&Key::Gateway(id)))
-                    .and_then(|()| self.save_config());
-                if let Err(e) = result {
-                    self.error(e);
+                // Passwords go only once the connection is gone from disk.
+                match self.save_config() {
+                    Ok(()) => {
+                        self.keyring(KeyringOp::Delete(Key::Rdp(id)));
+                        self.keyring(KeyringOp::Delete(Key::Gateway(id)));
+                    }
+                    Err(e) => self.error(e),
                 }
             }
             Action::ClearGroup => {
-                let Some(g) = self.group_draft.as_mut() else {
+                let Some(name) = self.group_draft.as_ref().map(|g| g.original.name.clone()) else {
                     return;
                 };
-                let name = g.original.name.clone();
+                if let Err(e) = self.ensure_writable() {
+                    return self.error(e);
+                }
                 self.config.groups.retain(|x| x.name != name);
-                *g = GroupDraft::new(&self.config, &name);
-                let result = secrets::delete(&Key::GroupGateway(name.clone()))
-                    .and_then(|()| secrets::delete(&Key::GroupRdp(name.clone())))
-                    .and_then(|()| self.save_config());
-                match result {
-                    Ok(()) => self.info(format!("Cleared the defaults of “{name}”")),
+                self.group_draft = Some(GroupDraft::new(&self.config, &name));
+                match self.save_config() {
+                    Ok(()) => {
+                        self.keyring(KeyringOp::Delete(Key::GroupGateway(name.clone())));
+                        self.keyring(KeyringOp::Delete(Key::GroupRdp(name.clone())));
+                        self.info(format!("Cleared the defaults of “{name}”"));
+                    }
                     Err(e) => self.error(e),
                 }
             }
@@ -896,7 +1030,7 @@ impl App {
                 }
             }
             Action::AskQuit => {
-                if self.sessions.iter().any(Session::is_running) {
+                if self.prepare_quit() {
                     self.confirm_quit = true;
                     self.bring_to_front(ctx, None);
                 } else {
@@ -919,13 +1053,13 @@ impl App {
                 }
             }
             Action::ClearEnded => {
-                let shown = self
+                // The shown log stays open if its session is kept, at its new index:
+                // the number of running sessions before it.
+                self.log_session = self
                     .log_session
-                    .and_then(|i| self.sessions.get(i))
-                    .map(|s| s as *const Session);
+                    .filter(|&i| self.sessions.get(i).is_some_and(Session::is_running))
+                    .map(|i| self.sessions[..i].iter().filter(|s| s.is_running()).count());
                 self.sessions.retain(Session::is_running);
-                self.log_session =
-                    shown.and_then(|p| self.sessions.iter().position(|s| std::ptr::eq(s, p)));
             }
             Action::SaveSettings => {
                 if let Some(s) = self.settings_draft.take() {
@@ -946,57 +1080,39 @@ impl App {
     }
 
     fn forget(&mut self, key: &Key) -> Result<()> {
-        secrets::delete(key)?;
-        match key {
-            Key::Rdp(id) | Key::Gateway(id) => {
-                let rdp = matches!(key, Key::Rdp(_));
-                let drafts = self
-                    .draft
-                    .as_mut()
-                    .map(|d| &mut d.conn)
-                    .filter(|c| c.id == *id);
-                for c in self
-                    .config
-                    .connections
-                    .iter_mut()
-                    .filter(|c| c.id == *id)
-                    .chain(drafts)
-                {
-                    if rdp {
-                        c.has_saved_password = false;
-                    } else {
-                        c.has_saved_gateway_password = false;
+        self.ensure_writable()?;
+        self.set_saved_flag(key, false);
+        self.save_config()?;
+        self.keyring(KeyringOp::Delete(key.clone()));
+        Ok(())
+    }
+
+    /// Queues a keyring change; failures come back through [`App::poll_keyring`].
+    fn keyring(&self, op: KeyringOp) {
+        let (done, bus) = (self.keyring_done.clone(), self.bus.clone());
+        self.keyring.run(move || {
+            let failed = match op {
+                KeyringOp::Set(key, password) => {
+                    secrets::set(&key, &password).err().map(|e| (Some(key), e))
+                }
+                KeyringOp::Delete(key) => secrets::delete(&key).err().map(|e| (None, e)),
+                KeyringOp::Move { from, to } => {
+                    let copied = secrets::get(&from).and_then(|pw| match pw {
+                        Some(pw) => secrets::set(&to, &pw),
+                        None => Ok(()),
+                    });
+                    match copied {
+                        // Keep the old entry if the copy failed; nothing is lost.
+                        Err(e) => Some((Some(to), e)),
+                        Ok(()) => secrets::delete(&from).err().map(|e| (None, e)),
                     }
                 }
+            };
+            if let Some((key, e)) = failed {
+                done.lock().unwrap().push(KeyringDone::Failed(key, e));
+                bus.wake();
             }
-            Key::GroupRdp(name) => {
-                for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
-                    g.has_saved_password = false;
-                }
-                if let Some(g) = self
-                    .group_draft
-                    .as_mut()
-                    .filter(|g| g.original.name == *name)
-                {
-                    g.group.has_saved_password = false;
-                    g.original.has_saved_password = false;
-                }
-            }
-            Key::GroupGateway(name) => {
-                for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
-                    g.has_saved_gateway_password = false;
-                }
-                if let Some(g) = self
-                    .group_draft
-                    .as_mut()
-                    .filter(|g| g.original.name == *name)
-                {
-                    g.group.has_saved_gateway_password = false;
-                    g.original.has_saved_gateway_password = false;
-                }
-            }
-        }
-        self.save_config()
+        });
     }
 
     /// Removes FreeRDP's trust-on-first-use record for a host so a changed certificate
@@ -1086,65 +1202,169 @@ impl App {
         let Some(conn) = self.find_any(id).cloned() else {
             return;
         };
-        let saved_conn = self.find(id).is_some();
         let resolved = self.config.resolve(&conn);
-
-        let saved = resolved.password_key.as_ref().and_then(|key| {
-            secrets::get(key).unwrap_or_else(|e| {
-                self.error(e);
-                None
-            })
+        let password_key = resolved.password_key;
+        let gateway_key = resolved
+            .gateway
+            .filter(|gw| !gw.same_credentials)
+            .and_then(|gw| gw.saved_password);
+        if password_key.is_none() && gateway_key.is_none() {
+            return self.got_passwords(conn, Ok(None), Ok(None));
+        }
+        let (done, bus) = (self.keyring_done.clone(), self.bus.clone());
+        self.pending_lookups += 1;
+        self.keyring.run(move || {
+            let get = |key: Option<Key>| key.map_or(Ok(None), |k| secrets::get(&k));
+            let lookup = Lookup {
+                password: get(password_key),
+                gateway_password: get(gateway_key),
+                conn,
+            };
+            done.lock()
+                .unwrap()
+                .push(KeyringDone::Looked(Box::new(lookup)));
+            bus.wake();
         });
-        match saved {
-            Some(password) => self.launch(&conn, Some(password)),
-            None => {
-                let user = match (resolved.domain.as_str(), resolved.username.as_str()) {
-                    (_, "") => String::new(),
-                    ("", u) => format!("{u}@"),
-                    (d, u) => format!("{d}\\{u}@"),
-                };
-                let save_to = match &resolved.creds_from_group {
-                    Some(g) => Some((
-                        Key::GroupRdp(g.clone()),
-                        format!("Save in keyring for group “{g}”"),
-                    )),
-                    None if saved_conn => Some((Key::Rdp(id), "Save in keyring".to_string())),
-                    None => None,
-                };
-                self.prompt = Some(PasswordPrompt {
-                    target: format!("{user}{}", conn.host.trim()),
-                    conn,
-                    password: String::new(),
-                    save_to,
-                    remember: false,
-                });
+    }
+
+    /// Handles finished keyring work: continues connections whose passwords were looked
+    /// up, and reports failed changes.
+    fn poll_keyring(&mut self) {
+        let done = std::mem::take(&mut *self.keyring_done.lock().unwrap());
+        for d in done {
+            match d {
+                KeyringDone::Looked(l) => {
+                    self.pending_lookups -= 1;
+                    self.got_passwords(l.conn, l.password, l.gateway_password);
+                }
+                KeyringDone::Failed(key, e) => {
+                    if let Some(key) = key {
+                        self.set_saved_flag(&key, false);
+                        if let Err(e) = self.save_config() {
+                            self.error(e);
+                        }
+                    }
+                    self.error(e);
+                }
             }
         }
+    }
+
+    fn keyring_result(&mut self, result: Result<Option<String>>) -> Option<String> {
+        result.unwrap_or_else(|e| {
+            self.error(e);
+            None
+        })
+    }
+
+    /// Launches `conn` with the passwords from the keyring, or asks for missing ones.
+    fn got_passwords(
+        &mut self,
+        conn: Connection,
+        password: Result<Option<String>>,
+        gateway_password: Result<Option<String>>,
+    ) {
+        let password = self.keyring_result(password);
+        let gateway_password = self.keyring_result(gateway_password);
+        let saved_conn = self.find(conn.id).is_some();
+        let resolved = self.config.resolve(&conn);
+        let user_at = |domain: &str, user: &str| match (domain, user) {
+            (_, "") => String::new(),
+            ("", u) => format!("{u}@"),
+            (d, u) => format!("{d}\\{u}@"),
+        };
+        // A gateway with its own credentials needs its own password.
+        let gateway = resolved
+            .gateway
+            .as_ref()
+            .filter(|gw| !gw.same_credentials && !gw.host.is_empty())
+            .filter(|_| gateway_password.is_none())
+            .map(|gw| GatewayPrompt {
+                target: format!("{}{}", user_at(&gw.domain, &gw.username), gw.host),
+                password: String::new(),
+                save_to: match &gw.from_group {
+                    Some(g) => Some((
+                        Key::GroupGateway(g.clone()),
+                        format!("Save in keyring for group “{g}”"),
+                    )),
+                    None if saved_conn => {
+                        Some((Key::Gateway(conn.id), "Save in keyring".to_string()))
+                    }
+                    None => None,
+                },
+                remember: false,
+            });
+        if password.is_some() && gateway.is_none() {
+            return self.launch(&conn, password, gateway_password);
+        }
+        let save_to = match &resolved.creds_from_group {
+            Some(g) => Some((
+                Key::GroupRdp(g.clone()),
+                format!("Save in keyring for group “{g}”"),
+            )),
+            None if saved_conn => Some((Key::Rdp(conn.id), "Save in keyring".to_string())),
+            None => None,
+        };
+        self.prompt = Some(PasswordPrompt {
+            target: format!(
+                "{}{}",
+                user_at(&resolved.domain, &resolved.username),
+                conn.host.trim()
+            ),
+            conn,
+            saved_password: password,
+            password: String::new(),
+            save_to,
+            remember: false,
+            gateway,
+            saved_gateway_password: gateway_password,
+            focused: false,
+        });
     }
 
     fn launch_from_prompt(&mut self) {
         let Some(p) = self.prompt.take() else { return };
-        if let Some((key, _)) = p.save_to.filter(|_| p.remember && !p.password.is_empty()) {
-            match secrets::set(&key, &p.password) {
-                Ok(()) => {
-                    self.mark_saved(&key);
-                    if let Err(e) = self.save_config() {
-                        self.error(e);
-                    }
-                }
-                Err(e) => self.error(e),
+        let typed = |pw: String| Some(pw).filter(|p| !p.is_empty());
+        if p.remember
+            && let Some((key, _)) = &p.save_to
+            && !p.password.is_empty()
+        {
+            self.remember(key, &p.password);
+        }
+        let mut gateway_password = p.saved_gateway_password;
+        if let Some(g) = p.gateway {
+            if g.remember
+                && let Some((key, _)) = &g.save_to
+                && !g.password.is_empty()
+            {
+                self.remember(key, &g.password);
             }
+            gateway_password = typed(g.password);
         }
         // An empty password lets FreeRDP prompt (or use Kerberos/smartcard) itself.
-        let password = Some(p.password).filter(|p| !p.is_empty());
+        let password = p.saved_password.or_else(|| typed(p.password));
         let conn = self.find_any(p.conn.id).cloned().unwrap_or(p.conn);
-        self.launch(&conn, password);
+        self.launch(&conn, password, gateway_password);
     }
 
-    /// Records that a password is now in the keyring under `key`.
-    fn mark_saved(&mut self, key: &Key) {
+    /// Saves a password typed into the prompt in the keyring.
+    fn remember(&mut self, key: &Key, password: &str) {
+        if let Err(e) = self.ensure_writable() {
+            return self.error(e);
+        }
+        self.keyring(KeyringOp::Set(key.clone(), password.to_string()));
+        self.set_saved_flag(key, true);
+        if let Err(e) = self.save_config() {
+            self.error(e);
+        }
+    }
+
+    /// Records whether a password is in the keyring under `key`, in the config and in
+    /// whatever is being edited.
+    fn set_saved_flag(&mut self, key: &Key, saved: bool) {
         match key {
-            Key::Rdp(id) => {
+            Key::Rdp(id) | Key::Gateway(id) => {
+                let rdp = matches!(key, Key::Rdp(_));
                 let drafts = self
                     .draft
                     .as_mut()
@@ -1157,37 +1377,44 @@ impl App {
                     .filter(|c| c.id == *id)
                     .chain(drafts)
                 {
-                    c.has_saved_password = true;
+                    if rdp {
+                        c.has_saved_password = saved;
+                    } else {
+                        c.has_saved_gateway_password = saved;
+                    }
                 }
             }
-            Key::GroupRdp(name) => {
+            Key::GroupRdp(name) | Key::GroupGateway(name) => {
+                let rdp = matches!(key, Key::GroupRdp(_));
+                let set = |g: &mut Group| {
+                    if rdp {
+                        g.has_saved_password = saved;
+                    } else {
+                        g.has_saved_gateway_password = saved;
+                    }
+                };
                 for g in self.config.groups.iter_mut().filter(|g| g.name == *name) {
-                    g.has_saved_password = true;
+                    set(g);
                 }
                 if let Some(g) = self
                     .group_draft
                     .as_mut()
                     .filter(|g| g.original.name == *name)
                 {
-                    g.group.has_saved_password = true;
-                    g.original.has_saved_password = true;
+                    set(&mut g.group);
+                    set(&mut g.original);
                 }
             }
-            Key::Gateway(_) | Key::GroupGateway(_) => {}
         }
     }
 
-    fn launch(&mut self, conn: &Connection, password: Option<String>) {
+    fn launch(
+        &mut self,
+        conn: &Connection,
+        password: Option<String>,
+        gateway_password: Option<String>,
+    ) {
         let resolved = self.config.resolve(conn);
-        let gateway_password = match &resolved.gateway {
-            Some(gw) if !gw.same_credentials => gw.saved_password.as_ref().and_then(|key| {
-                secrets::get(key).unwrap_or_else(|e| {
-                    self.error(e);
-                    None
-                })
-            }),
-            _ => None,
-        };
         let creds = Credentials {
             password: password.as_deref(),
             gateway_password: gateway_password.as_deref(),
@@ -1294,6 +1521,11 @@ impl App {
     }
 
     fn update_probe_targets(&mut self) {
+        let version = self.config_version.get();
+        if self.probed_version == Some(version) {
+            return;
+        }
+        self.probed_version = Some(version);
         let targets = if self.config.settings.probe_hosts {
             self.config
                 .connections
@@ -1301,7 +1533,7 @@ impl App {
                 .filter(|c| !c.host.trim().is_empty())
                 .map(|c| {
                     // Behind a gateway the host itself is usually not reachable; check the gateway.
-                    let (host, port) = match self.config.resolve(c).gateway {
+                    let (host, port) = match self.config.gateway(c) {
                         Some(gw) if !gw.host.is_empty() => model::split_host_port(&gw.host, 443),
                         _ => (c.host.trim().to_string(), c.port),
                     };
@@ -1806,7 +2038,18 @@ impl App {
                 });
 
                 section(ui, "Redirection", true, |ui| {
-                    row(ui, "", |ui| ui.checkbox(&mut c.clipboard, "Clipboard"));
+                    row(ui, "Clipboard", |ui| {
+                        share_combo(ui, "clipboard_text", &mut c.clipboard_text).on_hover_text(
+                            "Copy and paste text and images between this computer and the \
+                             remote one",
+                        )
+                    });
+                    row(ui, "Files", |ui| {
+                        share_combo(ui, "clipboard_files", &mut c.clipboard_files).on_hover_text(
+                            "Copy and paste files between the computers. Pasting remote \
+                             files here needs FUSE.",
+                        )
+                    });
                     row(ui, "", |ui| {
                         ui.checkbox(&mut c.home_drive, "Home folder as a drive")
                     });
@@ -1937,7 +2180,8 @@ impl App {
                     gw.saved_password.is_some() || !d.gateway_password.is_empty()
                 });
                 let creds = Credentials {
-                    password: (c.has_saved_password || !d.password.is_empty()).then_some("x"),
+                    password: (resolved.password_key.is_some() || !d.password.is_empty())
+                        .then_some("x"),
                     gateway_password: gateway_password.then_some("x"),
                 };
                 command_preview(ui, &resolved, &settings, &creds);
@@ -2250,25 +2494,50 @@ impl App {
             let mut cancel = false;
             let resp = egui::Modal::new(egui::Id::unique("password_prompt")).show(ctx, |ui| {
                 ui.set_width(340.0);
-                ui.heading("Password");
-                ui.label(format!("Connecting to {}", p.target));
-                ui.add_space(6.0);
-                let field = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut p.password)
-                            .password(true)
-                            .hint_text("Leave empty to let FreeRDP ask")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .accessible_name("Password");
-                field.request_focus();
-                if let Some((_, label)) = &p.save_to {
-                    ui.checkbox(&mut p.remember, label.as_str());
+                let mut first_field = None;
+                if p.saved_password.is_none() {
+                    ui.heading("Password");
+                    ui.label(format!("Connecting to {}", p.target));
+                    ui.add_space(6.0);
+                    let field = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut p.password)
+                                .password(true)
+                                .hint_text("Leave empty to let FreeRDP ask")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .accessible_name("Password");
+                    first_field = Some(field);
+                    if let Some((_, label)) = &p.save_to {
+                        ui.checkbox(&mut p.remember, label.as_str());
+                    }
+                }
+                if let Some(g) = &mut p.gateway {
+                    ui.add_space(6.0);
+                    ui.heading("Gateway password");
+                    ui.label(format!("Gateway {}", g.target));
+                    ui.add_space(6.0);
+                    let field = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut g.password)
+                                .password(true)
+                                .hint_text("Leave empty to let FreeRDP ask")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .accessible_name("Gateway password");
+                    first_field.get_or_insert(field);
+                    if let Some((_, label)) = &g.save_to {
+                        ui.checkbox(&mut g.remember, label.as_str());
+                    }
+                }
+                if let Some(field) = first_field.filter(|_| !p.focused) {
+                    field.request_focus();
+                    p.focused = true;
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    // The field re-takes focus every frame, so it never reports losing it on
-                    // Enter; treat Enter anywhere in this dialog as "Connect".
+                    // Enter in a field ends editing it; treat Enter anywhere in this dialog
+                    // as "Connect".
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Connect").clicked() || enter {
                         self.actions.push(Action::Launch);
@@ -2348,7 +2617,6 @@ impl App {
                         ui.label("");
                         ui.checkbox(&mut s.probe_hosts, "Check whether hosts are reachable");
                         ui.end_row();
-                        ui.label("");
                         ui.label("");
                         ui.checkbox(
                             &mut s.tray,
@@ -2513,14 +2781,28 @@ impl App {
         if self.confirm_quit {
             let mut close = false;
             let resp = egui::Modal::new(egui::Id::unique("confirm_quit")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
                 ui.heading("Quit?");
                 let n = self.sessions.iter().filter(|s| s.is_running()).count();
-                ui.label(format!(
-                    "{n} session(s) are still running and will be disconnected."
-                ));
+                if n > 0 {
+                    ui.label(format!(
+                        "{n} session(s) are still running and will be disconnected."
+                    ));
+                }
+                if let Some(e) = &self.quit_save_error {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Your unsaved changes couldn't be saved: {e}"),
+                    );
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Disconnect and quit").clicked() {
+                    let label = match (n > 0, self.quit_save_error.is_some()) {
+                        (true, true) => "Disconnect and quit without saving",
+                        (false, true) => "Quit without saving",
+                        _ => "Disconnect and quit",
+                    };
+                    if ui.button(label).clicked() {
                         self.actions.push(Action::Quit);
                     }
                     close = ui.button("Cancel").clicked();
@@ -2528,6 +2810,7 @@ impl App {
             });
             if close || resp.should_close() {
                 self.confirm_quit = false;
+                self.quit_save_error = None;
             }
         }
     }
@@ -2570,6 +2853,16 @@ impl App {
         self.update_probe_targets();
         self.handle_shortcuts(&ctx);
         self.handle_commands(&ctx);
+        self.poll_keyring();
+        // A request from the tray or another launch that needs a password brings the
+        // window forward.
+        if self.prompt.is_some()
+            && let Some(token) = self.raise_for_prompt.take()
+        {
+            self.bring_to_front(&ctx, token);
+        } else if self.pending_lookups == 0 {
+            self.raise_for_prompt = None;
+        }
         self.sync_integrations();
         if let Some(n) = self.inbox.lock().unwrap().pop() {
             self.notice = Some(n);
@@ -2592,7 +2885,7 @@ impl App {
                         false,
                     );
                 }
-            } else if any_running {
+            } else if self.prepare_quit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_quit = true;
             } else {
@@ -2712,7 +3005,7 @@ fn connection_row(
         None => {}
     }
 
-    let target = match config.resolve(c).gateway {
+    let target = match config.gateway(c) {
         Some(gw) => format!("{}:{} via gateway {}", c.host, c.port, gw.host),
         None => format!("{}:{}", c.host, c.port),
     };
@@ -2758,6 +3051,19 @@ fn connection_row(
             actions.push(Action::AskDelete(c.id));
         }
     });
+}
+
+/// A combo box choosing which way the shared clipboard copies.
+fn share_combo(ui: &mut egui::Ui, id: &str, value: &mut ClipboardShare) -> egui::Response {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.label())
+        .width(260.0)
+        .show_ui(ui, |ui| {
+            for s in ClipboardShare::ALL {
+                ui.selectable_value(value, s, s.label());
+            }
+        })
+        .response
 }
 
 fn section(ui: &mut egui::Ui, title: &str, open: bool, body: impl FnOnce(&mut egui::Ui)) {
@@ -3451,6 +3757,164 @@ mod ui_tests {
 
         app.exit = Exit::Quit;
         assert!(matches!(app.run_hidden(), Next::Quit));
+    }
+
+    #[test]
+    fn clear_ended_keeps_the_shown_log() {
+        let env = TestEnv::new("clearended");
+        let slow = env.dir.join("slow-freerdp");
+        std::fs::write(&slow, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut h = env.harness();
+        let fake = h.state().config.settings.client.clone();
+        // Three sessions; the middle one keeps running.
+        for client in [&fake, &slow.to_string_lossy().into_owned(), &fake] {
+            h.state_mut().config.settings.client = client.clone();
+            h.state_mut().connect_target("Alpha");
+            h.state_mut().actions.push(Action::Launch);
+            h.run_steps(2);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.state().sessions.iter().filter(|s| s.is_running()).count() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake clients did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            h.step();
+        }
+        let app = h.state_mut();
+        let running = app.sessions[1].started;
+        app.log_session = Some(1);
+        app.actions.push(Action::ClearEnded);
+        h.run_steps(2);
+        let app = h.state();
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(
+            app.log_session,
+            Some(0),
+            "the running session's log stays open"
+        );
+        assert_eq!(app.sessions[0].started, running);
+        h.state_mut().actions.push(Action::Stop(0));
+        wait_for_sessions(&mut h);
+
+        // The log of a cleared session closes rather than showing another one.
+        let app = h.state_mut();
+        app.log_session = Some(0);
+        app.actions.push(Action::ClearEnded);
+        h.run_steps(2);
+        assert!(h.state().sessions.is_empty() && h.state().log_session.is_none());
+    }
+
+    #[test]
+    fn quitting_saves_pending_edits() {
+        let env = TestEnv::new("quitsave");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+        h.state_mut().draft.as_mut().unwrap().conn.name = "Alpha edited".into();
+        h.state_mut().actions.push(Action::AskQuit);
+        h.run_steps(2);
+        assert!(!h.state().confirm_quit, "saved, so nothing to confirm");
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert!(saved.connections.iter().any(|c| c.name == "Alpha edited"));
+
+        // If the edits can't be saved, quitting asks first.
+        let env = TestEnv::new("quitfail");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+        let app = h.state_mut();
+        app.load_error = Some("broken".into());
+        app.draft.as_mut().unwrap().conn.name = "Lost".into();
+        app.actions.push(Action::AskQuit);
+        h.run_steps(3);
+        assert!(h.state().confirm_quit);
+        assert!(has_label(&h, "Quit without saving"));
+        assert!(has_label(&h, "couldn't be saved"));
+    }
+
+    #[test]
+    fn asks_for_a_gateway_password() {
+        let env = TestEnv::new("gateway");
+        let mut h = env.harness();
+        let alpha = h.state().config.connections[0].id;
+        let conn = &mut h.state_mut().config.connections[0];
+        conn.gateway = GatewayMode::On;
+        conn.gateway_host = "gw.example".into();
+        conn.gateway_same_credentials = false;
+        conn.gateway_username = "gwuser".into();
+        h.state_mut().connect(alpha);
+        h.run_steps(3);
+        let p = h.state().prompt.as_ref().expect("asks for passwords");
+        let g = p.gateway.as_ref().expect("asks for the gateway password");
+        assert_eq!(g.target, "gwuser@gw.example");
+        assert!(matches!(&g.save_to, Some((Key::Gateway(id), _)) if *id == alpha));
+        assert!(has_label(&h, "Gateway gwuser@gw.example"));
+
+        let p = h.state_mut().prompt.as_mut().unwrap();
+        p.password = "pw".into();
+        p.gateway.as_mut().unwrap().password = "gwpw".into();
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(2);
+        let cmd = &h.state().sessions[0].command;
+        assert!(
+            cmd.contains("/gateway:g:gw.example,u:gwuser,p:***") && cmd.contains("/p:***"),
+            "{cmd}"
+        );
+        wait_for_sessions(&mut h);
+    }
+
+    #[test]
+    fn failed_keyring_save_is_reported() {
+        let env = TestEnv::new("keyringfail");
+        let mut h = env.harness();
+        select_alpha(&mut h);
+        let alpha = h.state().config.connections[0].id;
+        // As if saving Alpha's password had succeeded here but failed in the keyring.
+        h.state_mut().config.connections[0].has_saved_password = true;
+        h.state_mut()
+            .draft
+            .as_mut()
+            .unwrap()
+            .conn
+            .has_saved_password = true;
+        h.state()
+            .keyring_done
+            .lock()
+            .unwrap()
+            .push(KeyringDone::Failed(
+                Some(Key::Rdp(alpha)),
+                anyhow::anyhow!("keyring is locked"),
+            ));
+        h.run_steps(2);
+        let app = h.state();
+        assert!(!app.config.connections[0].has_saved_password);
+        assert!(!app.draft.as_ref().unwrap().conn.has_saved_password);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(m, err)| *err && m.contains("locked"))
+        );
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert!(!saved.connections[0].has_saved_password);
+    }
+
+    #[test]
+    fn host_checks_follow_config_changes() {
+        let env = TestEnv::new("probeversion");
+        let mut h = env.harness();
+        let seen = h.state().probed_version;
+        assert!(seen.is_some());
+        h.run_steps(3);
+        assert_eq!(
+            h.state().probed_version,
+            seen,
+            "unchanged config: no rebuild"
+        );
+        let id = h.state().config.connections[0].id;
+        h.state_mut().actions.push(Action::ToggleFavorite(id));
+        h.run_steps(2);
+        assert_ne!(h.state().probed_version, seen);
     }
 
     #[test]

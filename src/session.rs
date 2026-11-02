@@ -1,7 +1,7 @@
 //! Running FreeRDP child processes and their captured output.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,17 +17,20 @@ use crate::diagnose::{self, Diagnosis, Severity};
 const MAX_LOG_LINES: usize = 5000;
 /// With no new attempt for this long, a reconnecting session is assumed to be back.
 const RECONNECT_QUIET: Duration = Duration::from_secs(20);
+/// How long to wait after the client exits for its last output lines.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub enum Status {
     Running,
     Exited(Diagnosis),
 }
 
-#[derive(Default)]
 pub struct Output {
     pub lines: Vec<String>,
     /// The latest "Attempting reconnect (n of m)" and when it was seen.
     pub reconnect: Option<(u32, u32, Instant)>,
+    /// Output streams (stdout, stderr) not yet read to the end.
+    open_streams: u8,
 }
 
 pub struct Session {
@@ -43,6 +46,8 @@ pub struct Session {
     /// Whether the user has been told about the current reconnect episode.
     pub reconnect_notified: bool,
     stopped_by_user: bool,
+    /// Set once the client has exited (and been reaped), while its last output drains.
+    exited: Option<(ExitStatus, Instant)>,
     child: Child,
 }
 
@@ -77,7 +82,11 @@ impl Session {
         let _ = stdin.write_all(payload.as_bytes());
         drop(stdin);
 
-        let output = Arc::new(Mutex::new(Output::default()));
+        let output = Arc::new(Mutex::new(Output {
+            lines: Vec::new(),
+            reconnect: None,
+            open_streams: 2,
+        }));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         pump(stdout, output.clone(), bus.clone());
@@ -94,25 +103,35 @@ impl Session {
             output,
             reconnect_notified: false,
             stopped_by_user: false,
+            exited: None,
             child,
         })
     }
 
-    /// Updates `status`; returns true if the process exited since the last poll.
+    /// Updates `status`; returns true if the session ended since the last poll.
     pub fn poll(&mut self) -> bool {
-        if let Status::Running = self.status
+        if !self.is_running() {
+            return false;
+        }
+        if self.exited.is_none()
             && let Ok(Some(exit)) = self.child.try_wait()
         {
-            // Give the reader threads a moment to drain the final lines.
-            thread::sleep(Duration::from_millis(50));
-            let out = self.output.lock().unwrap();
-            let diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
-            drop(out);
-            self.status = Status::Exited(diagnosis);
-            self.ended = Some(Instant::now());
-            return true;
+            self.exited = Some((exit, Instant::now()));
         }
-        false
+        let Some((exit, at)) = self.exited else {
+            return false;
+        };
+        let out = self.output.lock().unwrap();
+        // Wait for the reader threads to drain the final lines, unless something else
+        // (a process the client started, say) keeps the pipes open.
+        if out.open_streams > 0 && at.elapsed() < DRAIN_TIMEOUT {
+            return false;
+        }
+        let diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
+        drop(out);
+        self.status = Status::Exited(diagnosis);
+        self.ended = Some(at);
+        true
     }
 
     pub fn is_running(&self) -> bool {
@@ -175,7 +194,8 @@ impl Session {
 
     /// Asks the client to shut down gracefully.
     pub fn terminate(&mut self) {
-        if self.is_running() {
+        // Once reaped, the pid may already belong to another process.
+        if self.is_running() && self.exited.is_none() {
             self.stopped_by_user = true;
             // SAFETY: plain syscall on a pid we own and have not yet reaped.
             unsafe {
@@ -207,6 +227,8 @@ fn pump(stream: impl Read + Send + 'static, output: Arc<Mutex<Output>>, bus: Bus
             drop(out);
             bus.wake();
         }
+        output.lock().unwrap().open_streams -= 1;
+        bus.wake();
     });
 }
 
