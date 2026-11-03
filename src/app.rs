@@ -2847,11 +2847,28 @@ impl App {
                 }
                 egui::ScrollArea::vertical()
                     .max_height(380.0)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        // A grid is only as wide as its contents, so the columns are given
+                        // widths that add up to the window's; the details get what's left.
+                        const HOST: f32 = 200.0;
+                        const FINGERPRINT: f32 = 125.0;
+                        const FORGET: f32 = 60.0;
+                        const GAP: f32 = 12.0;
+                        let details =
+                            (ui.available_width() - HOST - FINGERPRINT - FORGET - 3.0 * GAP)
+                                .max(120.0);
+                        let column =
+                            |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(width);
+                                    add(ui);
+                                });
+                            };
                         egui::Grid::new("cert_grid")
                             .num_columns(4)
                             .striped(true)
-                            .spacing([12.0, 6.0])
+                            .spacing([GAP, 6.0])
                             .show(ui, |ui| {
                                 for cert in list {
                                     let used_by: Vec<&str> = self
@@ -2864,7 +2881,7 @@ impl App {
                                         })
                                         .map(|c| c.display_name())
                                         .collect();
-                                    ui.vertical(|ui| {
+                                    column(ui, HOST, &mut |ui| {
                                         ui.label(
                                             RichText::new(format!("{}:{}", cert.host, cert.port))
                                                 .strong(),
@@ -2873,51 +2890,55 @@ impl App {
                                             ui.weak(used_by.join(", "));
                                         }
                                     });
-                                    match &cert.error {
+                                    column(ui, details, &mut |ui| match &cert.error {
                                         Some(e) => {
                                             ui.colored_label(ui.visuals().warn_fg_color, e);
                                         }
                                         None => {
-                                            ui.vertical(|ui| {
-                                                ui.label(format!(
-                                                    "{} (issued by {})",
-                                                    cert.subject, cert.issuer
-                                                ));
-                                                if let Some(t) = cert.expires {
-                                                    let text =
-                                                        format!("Expires {}", t.format("%Y-%m-%d"));
-                                                    if cert.expired() {
-                                                        ui.colored_label(
-                                                            RED,
-                                                            format!("{text} (expired)"),
-                                                        );
-                                                    } else {
-                                                        ui.weak(text);
-                                                    }
+                                            ui.label(format!(
+                                                "{} (issued by {})",
+                                                cert.subject, cert.issuer
+                                            ));
+                                            if let Some(t) = cert.expires {
+                                                let text =
+                                                    format!("Expires {}", t.format("%Y-%m-%d"));
+                                                if cert.expired() {
+                                                    ui.colored_label(
+                                                        RED,
+                                                        format!("{text} (expired)"),
+                                                    );
+                                                } else {
+                                                    ui.weak(text);
                                                 }
-                                            });
+                                            }
                                         }
-                                    }
-                                    let short: String = cert.fingerprint.chars().take(23).collect();
+                                    });
+                                    column(ui, FINGERPRINT, &mut |ui| {
+                                        let short: String =
+                                            cert.fingerprint.chars().take(23).collect();
+                                        if ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(format!("{short}…"))
+                                                        .monospace()
+                                                        .small(),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(format!(
+                                                "SHA-256 {}\nClick to copy",
+                                                cert.fingerprint
+                                            ))
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(cert.fingerprint.clone());
+                                        }
+                                    });
                                     if ui
                                         .add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{short}…"))
-                                                    .monospace()
-                                                    .small(),
-                                            )
-                                            .sense(egui::Sense::click()),
+                                            egui::Button::new("Forget")
+                                                .min_size(egui::vec2(FORGET, 0.0)),
                                         )
-                                        .on_hover_text(format!(
-                                            "SHA-256 {}\nClick to copy",
-                                            cert.fingerprint
-                                        ))
-                                        .clicked()
-                                    {
-                                        ui.ctx().copy_text(cert.fingerprint.clone());
-                                    }
-                                    if ui
-                                        .button("Forget")
                                         .on_hover_text(
                                             "The next connection will ask you to check the new one",
                                         )
@@ -4198,6 +4219,43 @@ mod ui_tests {
         h.get_by_label("Close").click();
         h.run_steps(3);
         assert!(h.state().known_certs.is_none());
+    }
+
+    /// A certificate as the window would list it, with made-up names of the given length.
+    fn sample_cert(host: &str, subject: &str) -> KnownCert {
+        KnownCert {
+            path: PathBuf::from(format!("/nonexistent/{host}_3389.pem")),
+            host: host.into(),
+            port: 3389,
+            subject: subject.into(),
+            issuer: subject.into(),
+            expires: None,
+            fingerprint: vec!["AB"; 32].join(":"),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn certificate_list_fills_the_window() {
+        let env = TestEnv::new("certwidth");
+        let mut h = env.harness();
+        let long = "a-very-long-name-for-a-server.with.several.parts.example.org.".repeat(2);
+        h.state_mut().known_certs =
+            Some(vec![sample_cert("pc1", "PC1"), sample_cert(&long, &long)]);
+        h.run_steps(5);
+
+        let window_left = h.get_by_label("Trusted server certificates").rect().min.x;
+        let window_right = window_left + 720.0;
+        for host in ["pc1", long.as_str()] {
+            let forget = h
+                .get_by_label(&format!("Forget certificate for {host}"))
+                .rect();
+            assert!(
+                forget.max.x > window_right - 30.0 && forget.max.x <= window_right + 1.0,
+                "the {host} row should reach the right edge of the window: {forget:?}, \
+                 window {window_left}..{window_right}"
+            );
+        }
     }
 
     /// Replaces the connection's client with one that runs until it is stopped.
