@@ -175,6 +175,25 @@ pub enum GatewayMode {
     On,
 }
 
+/// How a connection reaches its host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Rdp,
+    /// A shell in a terminal window. `ssh` handles signing in and host keys by itself.
+    Ssh,
+}
+
+impl Protocol {
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Rdp => 3389,
+            Self::Ssh => 22,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Connection {
@@ -182,6 +201,9 @@ pub struct Connection {
     pub name: String,
     pub group: String,
 
+    pub protocol: Protocol,
+    /// Opens in a window of its own instead of inside the main window.
+    pub new_window: bool,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -241,6 +263,8 @@ impl Default for Connection {
             id: Uuid::new_v4(),
             name: String::new(),
             group: String::new(),
+            protocol: Protocol::Rdp,
+            new_window: false,
             host: String::new(),
             port: 3389,
             username: String::new(),
@@ -397,6 +421,9 @@ pub struct Resolved {
 pub struct Settings {
     /// FreeRDP client binary, e.g. `sdl-freerdp` or `xfreerdp`.
     pub client: String,
+    /// Command that opens a terminal for SSH connections, with `ssh` added to its end.
+    /// Empty picks an installed one.
+    pub terminal: String,
     pub log_level: String,
     /// Periodically check whether each host's RDP port is reachable.
     pub probe_hosts: bool,
@@ -411,6 +438,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             client: "sdl-freerdp".into(),
+            terminal: String::new(),
             log_level: "WARN".into(),
             probe_hosts: true,
             notifications: true,
@@ -563,7 +591,8 @@ impl Config {
             conn: conn.clone(),
             username,
             domain,
-            password_key,
+            // `ssh` asks for any password in its terminal.
+            password_key: password_key.filter(|_| conn.protocol == Protocol::Rdp),
             creds_from_group: creds_group.map(|g| g.name.clone()),
             scale: conn.scaling.percent(),
             cert,
@@ -577,6 +606,9 @@ impl Config {
 
     /// The gateway `conn` connects through, after inheritance.
     pub fn gateway(&self, conn: &Connection) -> Option<GatewayTarget> {
+        if conn.protocol == Protocol::Ssh {
+            return None;
+        }
         let group = self.group(&conn.group);
         match conn.gateway {
             GatewayMode::Off => None,

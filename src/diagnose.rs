@@ -436,6 +436,57 @@ pub fn untrusted_certificate() -> Diagnosis {
     }
 }
 
+/// How an SSH session ended. Only the terminal's exit is visible here: `ssh` reports its
+/// own errors inside the terminal window, which stays open for them.
+pub fn terminal_ended(exit: ExitStatus, stopped_by_user: bool) -> Diagnosis {
+    let (title, hint, severity) = match exit.code() {
+        _ if stopped_by_user => (
+            "Disconnected".to_string(),
+            "You disconnected this session.".to_string(),
+            Normal,
+        ),
+        Some(n) if n != 0 => (
+            format!("The terminal stopped with an error (exit code {n})"),
+            "Check the terminal command in Settings, and open the session log for details."
+                .to_string(),
+            Failed,
+        ),
+        // Closing the window ends some terminals with a signal.
+        _ => ("Session ended".to_string(), String::new(), Normal),
+    };
+    Diagnosis {
+        title,
+        hint,
+        severity,
+        fix: None,
+        code: None,
+        cert: None,
+    }
+}
+
+/// How an SSH session inside the main window ended. `ssh`'s own message is on its screen,
+/// which stays visible. Only exit code 255 is `ssh`'s own: anything else is what the remote
+/// shell ended with.
+pub fn ssh_ended(code: Option<i32>, stopped_by_user: bool) -> Diagnosis {
+    let (title, hint, severity) = match code {
+        _ if stopped_by_user => ("Disconnected", "You disconnected this session.", Normal),
+        Some(255) => (
+            "The SSH connection failed or dropped",
+            "ssh's message is in the terminal.",
+            Failed,
+        ),
+        _ => ("Session ended", "", Normal),
+    };
+    Diagnosis {
+        title: title.into(),
+        hint: hint.into(),
+        severity,
+        fix: None,
+        code: None,
+        cert: None,
+    }
+}
+
 pub fn diagnose(log: &[String], exit: ExitStatus, stopped_by_user: bool) -> Diagnosis {
     if stopped_by_user {
         return Diagnosis {

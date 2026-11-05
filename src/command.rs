@@ -3,7 +3,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::model::{CertPolicy, ClipboardShare, GatewayTarget, Resolved, Settings};
+use crate::model::{CertPolicy, ClipboardShare, GatewayTarget, Protocol, Resolved, Settings};
 
 /// Window class / app id for session windows. It matches `xrdp-gui-session.desktop`, so
 /// the desktop shows our icon on them, while keeping them apart from the main window
@@ -13,9 +13,110 @@ pub const SESSION_APP_ID: &str = "xrdp-gui-session";
 /// FreeRDP logs reconnect attempts at INFO under this tag; we watch for them.
 const RECONNECT_LOG_TAG: &str = "com.freerdp.client.common";
 
+/// Terminals known to stay running until their command ends, so the session list is
+/// right, with the arguments that make them run a command.
+const TERMINALS: &[(&str, &[&str])] = &[
+    ("konsole", &["--nofork", "-e"]),
+    ("gnome-terminal", &["--wait", "--"]),
+    ("ptyxis", &["--standalone", "--"]),
+    ("xfce4-terminal", &["--disable-server", "-x"]),
+    ("alacritty", &["-e"]),
+    ("kitty", &[]),
+    ("foot", &[]),
+    ("wezterm", &["start", "--always-new-process", "--"]),
+    ("xterm", &["-e"]),
+];
+
+/// Runs `ssh` with its arguments as `$@`. Terminals close when their command ends, which
+/// would take an error message with them, so a failure waits for a key press. Only exit
+/// code 255 is `ssh`'s own: anything else is what the remote shell ended with.
+const SSH_WRAPPER: &str = r#"ssh "$@"
+status=$?
+if [ "$status" -eq 255 ]; then
+    printf '\nThe connection failed or dropped. Press Enter to close this window. '
+    read -r _
+fi
+exit "$status""#;
+
 pub struct Credentials<'a> {
     pub password: Option<&'a str>,
     pub gateway_password: Option<&'a str>,
+}
+
+/// The arguments for `ssh`. Leaves signing in to `ssh`, so keys, the agent and
+/// `~/.ssh/config` all work, and host keys are checked as usual.
+pub fn ssh_args(r: &Resolved) -> Result<Vec<String>> {
+    let conn = &r.conn;
+    let host = conn.host.trim().trim_matches(['[', ']']);
+    if host.is_empty() {
+        bail!("host is required");
+    }
+    // `ssh` would read a host like `-oProxyCommand=…` as an option, and run it.
+    if host.starts_with('-') || host.contains(char::is_whitespace) {
+        bail!("“{host}” isn't a valid host name");
+    }
+    let mut args = Vec::new();
+    if conn.port != Protocol::Ssh.default_port() {
+        args.extend(["-p".to_string(), conn.port.to_string()]);
+    }
+    if !r.username.is_empty() {
+        args.extend(["-l".to_string(), r.username.clone()]);
+    }
+    let extra = conn.extra_args.trim();
+    if !extra.is_empty() {
+        match shlex::split(extra) {
+            Some(extra) => args.extend(extra),
+            None => bail!("extra arguments have unbalanced quotes"),
+        }
+    }
+    args.extend(["--".to_string(), host.to_string()]);
+    Ok(args)
+}
+
+/// The full command that opens a terminal running `ssh` with `ssh_args`.
+pub fn terminal_command(settings: &Settings, ssh_args: &[String]) -> Result<Vec<String>> {
+    let mut argv = terminal_prefix(&settings.terminal, on_path)?;
+    argv.extend(["sh", "-c", SSH_WRAPPER, "ssh"].map(String::from));
+    argv.extend_from_slice(ssh_args);
+    Ok(argv)
+}
+
+/// The terminal command for a setting: its words as given, except that the bare name of
+/// a known terminal also gets the arguments it needs. Empty picks an installed one.
+fn terminal_prefix(setting: &str, installed: impl Fn(&str) -> bool) -> Result<Vec<String>> {
+    let with_args = |name: &str, args: &[&str]| {
+        std::iter::once(name)
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let setting = setting.trim();
+    if setting.is_empty() {
+        return match TERMINALS.iter().find(|(name, _)| installed(name)) {
+            Some((name, args)) => Ok(with_args(name, args)),
+            None => bail!("No terminal program found. Set one in Settings to use SSH."),
+        };
+    }
+    if let Some((name, args)) = TERMINALS.iter().find(|(name, _)| *name == setting) {
+        return Ok(with_args(name, args));
+    }
+    match shlex::split(setting) {
+        Some(words) if !words.is_empty() => Ok(words),
+        _ => bail!("the terminal command in Settings has unbalanced quotes"),
+    }
+}
+
+/// The FreeRDP client that can draw inside another window, if there is one.
+pub fn embeddable_client(settings: &Settings) -> Option<String> {
+    if settings.client.contains("xfreerdp") {
+        return Some(settings.client.clone());
+    }
+    on_path("xfreerdp").then(|| "xfreerdp".to_string())
+}
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 pub fn build_args(r: &Resolved, settings: &Settings, creds: &Credentials) -> Result<Vec<String>> {
@@ -244,6 +345,110 @@ pub fn preview(client: &str, args: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::model::{Config, Connection, GatewayMode, Group, Profile};
+
+    fn ssh(c: Connection) -> Result<Vec<String>> {
+        ssh_args(&Config::default().resolve(&Connection {
+            protocol: Protocol::Ssh,
+            port: 22,
+            ..c
+        }))
+    }
+
+    #[test]
+    fn ssh_arguments() {
+        let plain = Connection {
+            host: " pc1 ".into(),
+            ..Default::default()
+        };
+        assert_eq!(ssh(plain).unwrap(), ["--", "pc1"]);
+
+        let config = Config::default();
+        let full = config.resolve(&Connection {
+            protocol: Protocol::Ssh,
+            host: "[::1]".into(),
+            port: 2222,
+            username: "bob".into(),
+            domain: "IGNORED".into(),
+            extra_args: r#"-i "~/my key""#.into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            ssh_args(&full).unwrap(),
+            ["-p", "2222", "-l", "bob", "-i", "~/my key", "--", "::1"]
+        );
+    }
+
+    #[test]
+    fn ssh_refuses_hosts_it_would_read_as_options() {
+        for host in ["-oProxyCommand=touch /tmp/x", "a b", "  ", ""] {
+            let c = Connection {
+                host: host.into(),
+                ..Default::default()
+            };
+            assert!(ssh(c).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_is_found_or_taken_from_the_setting() {
+        let only = |want: &'static str| move |name: &str| name == want;
+        assert_eq!(
+            terminal_prefix("", only("konsole")).unwrap(),
+            ["konsole", "--nofork", "-e"]
+        );
+        assert_eq!(terminal_prefix("", only("foot")).unwrap(), ["foot"]);
+        assert!(terminal_prefix("", |_| false).is_err());
+        // A known name gets what it needs, even if a different terminal is installed.
+        assert_eq!(
+            terminal_prefix("gnome-terminal", only("konsole")).unwrap(),
+            ["gnome-terminal", "--wait", "--"]
+        );
+        assert_eq!(
+            terminal_prefix("my-term --flag 'a b' -e", |_| false).unwrap(),
+            ["my-term", "--flag", "a b", "-e"]
+        );
+        assert!(terminal_prefix("bad 'quote", |_| false).is_err());
+    }
+
+    /// Runs the real wrapper with a stand-in `ssh`, as a terminal would.
+    fn run_wrapper(test: &str, exit: u8) -> (std::process::Output, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("xrdp-gui-wrap-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen = dir.join("seen");
+        let fake = dir.join("ssh");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do echo \"[$a]\" >> '{}'; done\nexit {exit}\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+        let output = std::process::Command::new("sh")
+            .args(["-c", SSH_WRAPPER, "ssh", "-i", "my key", "--", "pc1"])
+            .env("PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (output, std::fs::read_to_string(seen).unwrap())
+    }
+
+    #[test]
+    fn wrapper_passes_arguments_intact_and_waits_only_on_ssh_errors() {
+        let (failed, seen) = run_wrapper("failed", 255);
+        assert_eq!(seen, "[-i]\n[my key]\n[--]\n[pc1]\n");
+        assert_eq!(failed.status.code(), Some(255));
+        assert!(String::from_utf8_lossy(&failed.stdout).contains("Press Enter"));
+
+        // What the remote shell ended with is no reason to hold the window open.
+        let (remote, _) = run_wrapper("remote", 3);
+        assert_eq!(remote.status.code(), Some(3));
+        assert!(remote.stdout.is_empty());
+    }
 
     fn conn() -> Connection {
         Connection {

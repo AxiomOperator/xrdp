@@ -1,7 +1,9 @@
-//! Running FreeRDP child processes and their captured output.
+//! Running FreeRDP and terminal child processes and their captured output.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +16,8 @@ use crate::bus::Bus;
 use crate::certs;
 use crate::command;
 use crate::diagnose::{self, Diagnosis, Severity};
+use crate::embed::Area;
+use crate::terminal::Terminal;
 
 const MAX_LOG_LINES: usize = 5000;
 /// With no new attempt for this long, a reconnecting session is assumed to be back. FreeRDP
@@ -36,7 +40,31 @@ pub struct Output {
     open_streams: u8,
 }
 
+/// Where a session appears.
+pub enum Surface {
+    /// In a window of its own.
+    OwnWindow,
+    /// FreeRDP inside the main window.
+    Rdp {
+        /// The child window it draws into; gone once the session has ended.
+        holder: Option<u32>,
+        placed: Option<Area>,
+        visible: bool,
+    },
+    /// A terminal inside the main window.
+    Terminal(Box<Terminal>),
+}
+
+impl Surface {
+    pub fn in_main_window(&self) -> bool {
+        !matches!(self, Self::OwnWindow)
+    }
+}
+
 pub struct Session {
+    /// Tells this session apart for as long as the app runs (indexes shift).
+    pub uid: u64,
+    pub surface: Surface,
     pub connection_id: Uuid,
     pub name: String,
     pub started: Instant,
@@ -49,9 +77,17 @@ pub struct Session {
     /// Whether the user has been told about the current reconnect episode.
     pub reconnect_notified: bool,
     stopped_by_user: bool,
+    /// An SSH session in a terminal window, rather than FreeRDP.
+    terminal: bool,
     /// Set once the client has exited (and been reaped), while its last output drains.
     exited: Option<(ExitStatus, Instant)>,
-    child: Child,
+    /// None for a terminal inside the main window, which runs its program by itself.
+    child: Option<Child>,
+}
+
+fn next_uid() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Session {
@@ -64,7 +100,46 @@ impl Session {
         name: String,
         bus: &Bus,
     ) -> Result<Self> {
-        let mut child = Command::new(client)
+        Self::spawn_with(client, args, connection_id, name, bus, false)
+    }
+
+    /// Like [`Session::spawn`], for a client drawing inside the main window. If the app
+    /// dies without closing it, it must go too: it would stay logged in with nothing on
+    /// screen to show for it or close it with.
+    pub fn spawn_in_holder(
+        client: &str,
+        args: &[String],
+        connection_id: Uuid,
+        name: String,
+        bus: &Bus,
+    ) -> Result<Self> {
+        Self::spawn_with(client, args, connection_id, name, bus, true)
+    }
+
+    fn spawn_with(
+        client: &str,
+        args: &[String],
+        connection_id: Uuid,
+        name: String,
+        bus: &Bus,
+        die_with_app: bool,
+    ) -> Result<Self> {
+        let mut command = Command::new(client);
+        if die_with_app {
+            // SIGKILL because `xfreerdp` hangs in its SIGTERM handler once its window is gone.
+            // SAFETY: prctl is async-signal-safe, and nothing else happens between fork and
+            // exec here. The signal follows the thread that spawned this, which is the
+            // UI's, and that lasts as long as the app does.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .arg("/args-from:stdin")
             // sdl-freerdp's Wayland app id, which picks the window's icon.
             .env("SDL_APP_ID", command::SESSION_APP_ID)
@@ -85,6 +160,86 @@ impl Session {
         let _ = stdin.write_all(payload.as_bytes());
         drop(stdin);
 
+        let command = command::preview(client, args);
+        Ok(Self::started(
+            child,
+            connection_id,
+            name,
+            command,
+            false,
+            bus,
+        ))
+    }
+
+    /// Opens a terminal running `argv`. `command` is what to show for it in reports.
+    pub fn spawn_terminal(
+        argv: &[String],
+        command: String,
+        connection_id: Uuid,
+        name: String,
+        bus: &Bus,
+    ) -> Result<Self> {
+        let (program, args) = argv.split_first().context("no terminal command")?;
+        let child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!("Couldn't start the terminal `{program}`. Check the command in Settings.")
+            })?;
+        Ok(Self::started(
+            child,
+            connection_id,
+            name,
+            command,
+            true,
+            bus,
+        ))
+    }
+
+    /// Runs `program` in a terminal inside the main window.
+    pub fn spawn_in_main_window(
+        program: &str,
+        args: &[String],
+        command: String,
+        connection_id: Uuid,
+        name: String,
+        bus: &Bus,
+    ) -> Result<Self> {
+        let terminal = Terminal::spawn(program, args, bus)?;
+        Ok(Self {
+            uid: next_uid(),
+            surface: Surface::Terminal(Box::new(terminal)),
+            connection_id,
+            name,
+            started: Instant::now(),
+            started_at: Local::now(),
+            ended: None,
+            command,
+            status: Status::Running,
+            output: Arc::new(Mutex::new(Output {
+                lines: Vec::new(),
+                reconnect: None,
+                open_streams: 0,
+            })),
+            reconnect_notified: false,
+            stopped_by_user: false,
+            terminal: false,
+            exited: None,
+            child: None,
+        })
+    }
+
+    fn started(
+        mut child: Child,
+        connection_id: Uuid,
+        name: String,
+        command: String,
+        terminal: bool,
+        bus: &Bus,
+    ) -> Self {
         let output = Arc::new(Mutex::new(Output {
             lines: Vec::new(),
             reconnect: None,
@@ -95,20 +250,23 @@ impl Session {
         pump(stdout, output.clone(), bus.clone());
         pump(stderr, output.clone(), bus.clone());
 
-        Ok(Self {
+        Self {
+            uid: next_uid(),
+            surface: Surface::OwnWindow,
             connection_id,
             name,
             started: Instant::now(),
             started_at: Local::now(),
             ended: None,
-            command: command::preview(client, args),
+            command,
             status: Status::Running,
             output,
             reconnect_notified: false,
             stopped_by_user: false,
+            terminal,
             exited: None,
-            child,
-        })
+            child: Some(child),
+        }
     }
 
     /// Updates `status`; returns true if the session ended since the last poll.
@@ -116,8 +274,18 @@ impl Session {
         if !self.is_running() {
             return false;
         }
+        if let Surface::Terminal(terminal) = &self.surface {
+            let ended = terminal.ended();
+            if ended.is_none() && !self.stopped_by_user {
+                return false;
+            }
+            self.status =
+                Status::Exited(diagnose::ssh_ended(ended.flatten(), self.stopped_by_user));
+            self.ended = Some(Instant::now());
+            return true;
+        }
         if self.exited.is_none()
-            && let Ok(Some(exit)) = self.child.try_wait()
+            && let Some(Ok(Some(exit))) = self.child.as_mut().map(Child::try_wait)
         {
             self.exited = Some((exit, Instant::now()));
         }
@@ -129,6 +297,12 @@ impl Session {
         // (a process the client started, say) keeps the pipes open.
         if out.open_streams > 0 && at.elapsed() < DRAIN_TIMEOUT {
             return false;
+        }
+        if self.terminal {
+            drop(out);
+            self.status = Status::Exited(diagnose::terminal_ended(exit, self.stopped_by_user));
+            self.ended = Some(at);
+            return true;
         }
         let mut diagnosis = diagnose::diagnose(&out.lines, exit, self.stopped_by_user);
         drop(out);
@@ -203,12 +377,21 @@ impl Session {
 
     /// Asks the client to shut down gracefully.
     pub fn terminate(&mut self) {
+        if let Surface::Terminal(terminal) = &self.surface {
+            if self.is_running() {
+                self.stopped_by_user = true;
+                terminal.shutdown();
+            }
+            return;
+        }
         // Once reaped, the pid may already belong to another process.
-        if self.is_running() && self.exited.is_none() {
+        if let Some(child) = self.child.as_ref().filter(|_| self.exited.is_none())
+            && self.is_running()
+        {
             self.stopped_by_user = true;
             // SAFETY: plain syscall on a pid we own and have not yet reaped.
             unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
             }
         }
     }
@@ -217,7 +400,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         // Reap the child if it has exited so it does not linger as a zombie.
-        let _ = self.child.try_wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.try_wait();
+        }
     }
 }
 

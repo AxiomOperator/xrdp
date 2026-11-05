@@ -1,15 +1,18 @@
 mod app;
+mod backup;
 mod bus;
 mod certs;
 mod command;
 mod desktop;
 mod diagnose;
+mod embed;
 mod model;
 mod notify;
 mod probe;
 mod secrets;
 mod session;
 mod single_instance;
+mod terminal;
 mod tray;
 
 use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
@@ -76,16 +79,67 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     }
 }
 
+/// A connection manager has no need of a laptop's discrete GPU, and drawing on it costs a
+/// copy of every frame across to the GPU that drives the screen, which is slow through
+/// XWayland. So prefer an integrated GPU, of those that can actually draw to this window.
+/// `WGPU_POWER_PREF` overrides this.
+fn low_power_gpu() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
+    let mut config = WgpuConfiguration::default();
+    if wgpu::PowerPreference::from_env().is_none()
+        && let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup
+    {
+        setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+            adapters
+                .iter()
+                .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+                .min_by_key(|a| {
+                    let info = a.get_info();
+                    (
+                        gpu_rank(info.device_type),
+                        info.backend != wgpu::Backend::Vulkan,
+                    )
+                })
+                .cloned()
+                .ok_or_else(|| "no GPU can draw to this window".to_string())
+        }));
+    }
+    config
+}
+
+/// Lower is better. Drawing in software comes last, but still beats not starting.
+fn gpu_rank(device: eframe::egui_wgpu::wgpu::DeviceType) -> u8 {
+    use eframe::egui_wgpu::wgpu::DeviceType;
+    match device {
+        DeviceType::IntegratedGpu => 0,
+        DeviceType::DiscreteGpu => 1,
+        DeviceType::VirtualGpu => 2,
+        DeviceType::Other => 3,
+        DeviceType::Cpu => 4,
+    }
+}
+
 fn options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("xrdp-gui")
             .with_app_id("xrdp-gui")
             .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_min_inner_size([860.0, 420.0]),
         // Return when the window closes, so the app can live on in the tray and open
         // a new window later.
         run_and_return: true,
+        wgpu_options: low_power_gpu(),
+        event_loop_builder: Some(Box::new(|builder| {
+            // RDP sessions can only be shown inside an X11 window (see `embed`).
+            // `XRDP_GUI_WAYLAND` keeps the window native, and RDP sessions in their own.
+            if std::env::var_os("DISPLAY").is_some()
+                && std::env::var_os("XRDP_GUI_WAYLAND").is_none()
+            {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }
+        })),
         ..Default::default()
     }
 }
@@ -157,6 +211,13 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integrated_gpus_come_first_and_software_last() {
+        use eframe::egui_wgpu::wgpu::DeviceType::*;
+        assert!(super::gpu_rank(IntegratedGpu) < super::gpu_rank(DiscreteGpu));
+        assert!(super::gpu_rank(DiscreteGpu) < super::gpu_rank(Cpu));
+    }
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, String> {

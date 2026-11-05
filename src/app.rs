@@ -3,25 +3,28 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use eframe::egui::{self, Color32, Key as KeyCode, KeyboardShortcut, Modifiers, RichText};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::backup::{Backup, RestoreMode};
 use crate::bus::{Bus, Command};
 use crate::certs::{self, KnownCert};
 use crate::command::{self, Credentials};
 use crate::desktop;
 use crate::diagnose::{CertIssue, Fix, Severity};
+use crate::embed::{self, Area};
 use crate::model::{
     self, CertPolicy, CertReview, ClipboardShare, Config, Connection, GatewayMode, Group, Profile,
-    Resolved, Scaling, Settings,
+    Protocol, Resolved, Scaling, Settings,
 };
 use crate::notify;
 use crate::probe::{Prober, Reach, Target};
 use crate::secrets::{self, Key};
-use crate::session::{Session, Status};
+use crate::session::{Session, Status, Surface};
 use crate::single_instance::Primary;
+use crate::terminal::Terminal;
 use crate::tray::{self, Tray};
 
 /// eframe storage key for the last selected item.
@@ -161,6 +164,12 @@ struct Lookup {
     gateway_password: Result<Option<String>>,
 }
 
+/// A backup that was opened, waiting for a decision on how to restore it.
+struct PendingRestore {
+    backup: Backup,
+    file: String,
+}
+
 /// A change to the keyring, run in the background by [`App::keyring`].
 enum KeyringOp {
     Set(Key, String),
@@ -230,6 +239,13 @@ enum Action {
     Dismiss(usize),
     ClearEnded,
     SaveSettings,
+    /// Asks where to save a backup, then writes it.
+    Backup,
+    /// Asks for a backup to restore, then shows what restoring it would do.
+    PickRestore,
+    Restore(RestoreMode),
+    /// Shows a session in the main area, or the connection form.
+    ShowSession(Option<u64>),
     Quit,
 }
 
@@ -283,6 +299,21 @@ pub struct App {
     adhoc: Vec<Connection>,
     /// The certificate manager's list, while it is open.
     known_certs: Option<Vec<KnownCert>>,
+    backup_open: bool,
+    /// The backup being restored, while its window is open.
+    restore: Option<PendingRestore>,
+    /// A backup file opened in the background (or why it couldn't be).
+    restore_inbox: Arc<Mutex<Option<Result<PendingRestore, String>>>>,
+    /// The X11 side of the main window, when sessions can be shown inside it.
+    x11: Option<embed::Host>,
+    /// The session showing in the main area, instead of the connection form.
+    active_session: Option<u64>,
+    /// The main area, in window pixels, as of the last frame.
+    session_area: Option<Area>,
+    /// Window pixels per egui point, as of the last frame.
+    session_scale: f32,
+    /// What SSH connections run; only tests change this.
+    ssh_program: String,
     /// Whether to touch the desktop: tray icon and launcher actions (off in tests).
     integrations: bool,
     tray: Option<Tray>,
@@ -303,6 +334,7 @@ impl App {
         let path = Config::path().unwrap_or_else(|_| "xrdp-gui.toml".into());
         let mut app = Self::with_config_path(cc, instance, path);
         app.integrations = true;
+        app.x11 = embed::x11_window(cc).and_then(|window| embed::Host::new(window).ok());
         app.sync_tray_setting();
         if let Command::Connect { .. } = request {
             app.bus.send(request);
@@ -362,6 +394,14 @@ impl App {
             quick: String::new(),
             adhoc: Vec::new(),
             known_certs: None,
+            backup_open: false,
+            restore: None,
+            restore_inbox: Arc::default(),
+            x11: None,
+            active_session: None,
+            session_area: None,
+            session_scale: 1.0,
+            ssh_program: "ssh".to_string(),
             integrations: false,
             tray: None,
             launcher_favourites: None,
@@ -386,6 +426,33 @@ impl App {
         self.exit = Exit::Quit;
         self.allow_close = false;
         self.prober.set_paused(false);
+        if let Some(window) = embed::x11_window(cc) {
+            let holders: Vec<u32> = self.sessions.iter().filter_map(holder_of).collect();
+            let attached = match &mut self.x11 {
+                Some(host) => host.attach(window, holders.into_iter()),
+                None => embed::Host::new(window).map(|host| self.x11 = Some(host)),
+            };
+            if let Err(e) = attached {
+                self.error(e);
+            }
+        }
+    }
+
+    /// Moves sessions off the main window, which is about to close and would take them along.
+    pub fn detach_sessions(&mut self) {
+        let Some(host) = &self.x11 else { return };
+        for s in &mut self.sessions {
+            if let Surface::Rdp {
+                holder: Some(holder),
+                placed,
+                visible,
+            } = &mut s.surface
+            {
+                let _ = host.detach(*holder);
+                *placed = None;
+                *visible = false;
+            }
+        }
     }
 
     /// Whether a request is waiting on an answer that only the window can give.
@@ -401,6 +468,7 @@ impl App {
         self.confirm_second = None;
         self.confirm_quit = false;
         self.quit_save_error = None;
+        self.restore = None;
     }
 
     /// Runs while the window is closed (in the tray), until it should open again or
@@ -545,7 +613,8 @@ impl App {
     fn bring_to_front(&mut self, ctx: &egui::Context, token: Option<String>) {
         // Wayland doesn't let a window raise itself, but a new window may take focus
         // with an activation token, so close and reopen.
-        if token.is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // A window using X11 (even on a Wayland desktop) can just ask.
+        if token.is_some() && self.x11.is_none() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
             self.exit = Exit::Reopen(token);
             self.allow_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -568,15 +637,24 @@ impl App {
         }
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let modal_open = self.prompt.is_some()
+    /// Whether a window is open on top of the main area.
+    fn modal_open(&self) -> bool {
+        self.prompt.is_some()
             || self.confirm_delete.is_some()
             || self.confirm_second.is_some()
             || self.confirm_forget_cert.is_some()
             || self.known_certs.is_some()
+            || self.backup_open
+            || self.restore.is_some()
             || self.settings_draft.is_some()
-            || self.confirm_quit;
-        if modal_open {
+            || self.confirm_quit
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Keys belong to the remote machine while a terminal has them.
+        let in_terminal = ctx.memory(|m| m.focused()) == Some(Terminal::focus_id());
+        ctx.options_mut(|o| o.zoom_with_keyboard = !in_terminal);
+        if self.modal_open() || in_terminal {
             return;
         }
         let (new, save, find, quick, quit) = ctx.input_mut(|i| {
@@ -675,6 +753,139 @@ impl App {
             inbox.lock().unwrap().push(notice);
             ctx.request_repaint();
         });
+    }
+
+    /// Saves the current state to a file the user picks.
+    fn save_backup(&mut self, ctx: &egui::Context) {
+        self.backup_open = false;
+        // Without its config the app holds nothing worth saving, and an empty backup
+        // could later replace the real thing.
+        if let Err(e) = self.ensure_writable() {
+            return self.error(e);
+        }
+        if !self.commit() {
+            return;
+        }
+        let backup = Backup::of(&self.config);
+        let file_name = format!(
+            "xrdp-gui-backup-{}.toml",
+            chrono::Local::now().format("%Y%m%d")
+        );
+        let inbox = self.inbox.clone();
+        let ctx = ctx.clone();
+        // The file dialog blocks, so run it off the UI thread.
+        std::thread::spawn(move || {
+            let Some(path) = backup_dialog("Save backup")
+                .set_file_name(file_name)
+                .save_file()
+            else {
+                return;
+            };
+            let notice = match backup.write(&path) {
+                Ok(()) => (format!("Saved backup to {}", path.display()), false),
+                Err(e) => (format!("Couldn't save the backup: {e:#}"), true),
+            };
+            inbox.lock().unwrap().push(notice);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Opens a file the user picks; its contents then show up through `restore_inbox`.
+    fn pick_restore(&mut self, ctx: &egui::Context) {
+        self.backup_open = false;
+        let inbox = self.restore_inbox.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let Some(path) = backup_dialog("Restore backup").pick_file() else {
+                return;
+            };
+            let opened = Backup::read(&path)
+                .map(|backup| PendingRestore {
+                    backup,
+                    file: path.display().to_string(),
+                })
+                .map_err(|e| format!("{e:#}"));
+            *inbox.lock().unwrap() = Some(opened);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Keeps what's here in a file next to the config before a restore replaces it.
+    /// A config that failed to load is kept as it is on disk, for repairing by hand.
+    fn keep_before_restore(&self) -> Result<PathBuf> {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let dir = self
+            .config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!("before-restore-{stamp}.toml"));
+        if self.load_error.is_some() {
+            std::fs::copy(&self.config_path, &path)
+                .with_context(|| format!("keeping a copy of {}", self.config_path.display()))?;
+        } else {
+            Backup::of(&self.config).write(&path)?;
+        }
+        Ok(path)
+    }
+
+    fn restore_backup(&mut self, mode: RestoreMode) -> Result<()> {
+        let Some(pending) = self.restore.take() else {
+            return Ok(());
+        };
+        // A config that failed to load is replaced, or left alone; there's nothing to add
+        // to. Its unsaved edits can't be saved anyway.
+        let broken = self.load_error.is_some();
+        if broken {
+            if mode == RestoreMode::Add {
+                self.ensure_writable()?;
+            }
+            self.draft = None;
+            self.group_draft = None;
+        } else if !self.commit() {
+            return Ok(());
+        }
+        let kept = match mode {
+            RestoreMode::Add => None,
+            RestoreMode::Replace => Some(self.keep_before_restore()?),
+        };
+
+        let before = self.config.clone();
+        let outcome = pending.backup.restore(&mut self.config, mode);
+        let load_error = self.load_error.take();
+        if let Err(e) = self.save_config() {
+            self.config = before;
+            self.load_error = load_error;
+            return Err(e);
+        }
+        // Passwords go only once the connections are gone from disk.
+        for key in outcome.stale_passwords {
+            self.keyring(KeyringOp::Delete(key));
+        }
+
+        self.draft = match self.draft.as_ref().map(|d| d.conn.id) {
+            Some(id) => self.find(id).cloned().map(|c| Draft::new(c, false)),
+            None => None,
+        };
+        let group = self.group_draft.as_ref().map(|g| g.original.name.clone());
+        self.group_draft = group
+            .filter(|name| self.config.group_names().contains(name))
+            .map(|name| GroupDraft::new(&self.config, &name));
+        self.sync_tray_setting();
+
+        let mut message = match mode {
+            RestoreMode::Add => format!(
+                "Added {} and {}",
+                counted(outcome.added_connections, "connection"),
+                counted(outcome.added_groups, "group"),
+            ),
+            RestoreMode::Replace => format!("Restored {}", pending.file),
+        };
+        if let Some(kept) = kept {
+            message.push_str(&format!("; your previous setup is in {}", kept.display()));
+        }
+        self.info(message);
+        Ok(())
     }
 
     // ---- state helpers -------------------------------------------------------------
@@ -930,7 +1141,19 @@ impl App {
     // ---- actions -------------------------------------------------------------------
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        // Going to a connection or group leaves any session for the form.
+        if matches!(
+            action,
+            Action::NewConnection
+                | Action::NewGroup
+                | Action::Select(_)
+                | Action::SelectGroup(_)
+                | Action::Duplicate(_)
+        ) {
+            self.active_session = None;
+        }
         match action {
+            Action::ShowSession(uid) => self.active_session = uid,
             Action::NewConnection => {
                 let group = self.current_group();
                 if self.commit() {
@@ -1179,6 +1402,13 @@ impl App {
                     self.sync_tray_setting();
                 }
             }
+            Action::Backup => self.save_backup(ctx),
+            Action::PickRestore => self.pick_restore(ctx),
+            Action::Restore(mode) => {
+                if let Err(e) = self.restore_backup(mode) {
+                    self.error(e);
+                }
+            }
             Action::Quit => {
                 self.terminate_all();
                 self.exit = Exit::Quit;
@@ -1347,10 +1577,15 @@ impl App {
     /// Connects, first asking if the connection already has a session: a second sign-in
     /// usually disconnects the first.
     fn connect(&mut self, id: Uuid) {
-        if self
-            .sessions
-            .iter()
-            .any(|s| s.connection_id == id && s.is_running())
+        let ssh = self
+            .find_any(id)
+            .is_some_and(|c| c.protocol == Protocol::Ssh);
+        // Unlike RDP, any number of SSH sessions get along.
+        if !ssh
+            && self
+                .sessions
+                .iter()
+                .any(|s| s.connection_id == id && s.is_running())
         {
             self.confirm_second = Some(id);
         } else {
@@ -1370,6 +1605,9 @@ impl App {
         let Some(conn) = self.find_any(id).cloned() else {
             return;
         };
+        if conn.protocol == Protocol::Ssh {
+            return self.launch(&conn, None, None);
+        }
         let resolved = self.config.resolve(&conn);
         let password_key = resolved.password_key;
         let gateway_key = resolved
@@ -1588,22 +1826,313 @@ impl App {
             gateway_password: gateway_password.as_deref(),
         };
         let settings = &self.config.settings;
-        let result = command::build_args(&resolved, settings, &creds).and_then(|args| {
-            Session::spawn(
-                &settings.client,
-                &args,
-                conn.id,
-                conn.display_name().to_string(),
-                &self.bus,
-            )
-        });
+        let name = conn.display_name().to_string();
+        // Why an RDP session that should open in the main window can't.
+        let mut own_window_because = None;
+        let result = if conn.protocol == Protocol::Ssh {
+            command::ssh_args(&resolved).and_then(|args| {
+                let shown = command::preview("ssh", &args);
+                if conn.new_window {
+                    let argv = command::terminal_command(settings, &args)?;
+                    Session::spawn_terminal(&argv, shown, conn.id, name, &self.bus)
+                } else {
+                    Session::spawn_in_main_window(
+                        &self.ssh_program,
+                        &args,
+                        shown,
+                        conn.id,
+                        name,
+                        &self.bus,
+                    )
+                }
+            })
+        } else {
+            match self.main_window_client(conn, &resolved, password.is_some()) {
+                Ok(client) => self.spawn_rdp_in_main_window(conn, &client, &creds),
+                Err(reason) => {
+                    own_window_because = reason;
+                    command::build_args(&resolved, settings, &creds).and_then(|args| {
+                        Session::spawn(&settings.client, &args, conn.id, name, &self.bus)
+                    })
+                }
+            }
+        };
         match result {
             Ok(session) => {
+                if session.surface.in_main_window() {
+                    self.active_session = Some(session.uid);
+                }
                 self.sessions.push(session);
-                self.info(format!("Connecting to {}…", conn.display_name()));
+                self.info(match own_window_because.filter(|_| self.integrations) {
+                    Some(reason) => format!(
+                        "Connecting to {} in a new window: {reason}",
+                        conn.display_name()
+                    ),
+                    None => format!("Connecting to {}…", conn.display_name()),
+                });
                 self.touch(conn.id);
             }
             Err(e) => self.error(e),
+        }
+    }
+
+    /// The client to show an RDP session in the main window with. Otherwise it gets its own
+    /// window, and the reason says why, if the connection didn't ask for that.
+    fn main_window_client(
+        &self,
+        conn: &Connection,
+        resolved: &Resolved,
+        has_password: bool,
+    ) -> Result<String, Option<&'static str>> {
+        if conn.new_window {
+            return Err(None);
+        }
+        if self.x11.is_none() {
+            return Err(Some("the main window isn't using X11"));
+        }
+        // `xfreerdp` can only ask questions on a terminal, and sessions don't have one.
+        if resolved.cert == CertPolicy::Ask {
+            return Err(Some(
+                "its certificate needs checking, which FreeRDP asks about there",
+            ));
+        }
+        if !has_password {
+            return Err(Some("no password is set, so FreeRDP asks for it there"));
+        }
+        command::embeddable_client(&self.config.settings).ok_or(Some("xfreerdp isn't installed"))
+    }
+
+    fn spawn_rdp_in_main_window(
+        &self,
+        conn: &Connection,
+        client: &str,
+        creds: &Credentials,
+    ) -> Result<Session> {
+        let host = self
+            .x11
+            .as_ref()
+            .context("the main window isn't using X11")?;
+        let area = self.session_area.unwrap_or(Area {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 768,
+        });
+        // On a scaled screen, asking the server for every physical pixel of the main area
+        // can mean 4-5 times the work, for `xfreerdp` to draw in software: far too slow.
+        // So ask for the size in points, and let the X server stretch that to fit.
+        let scale = self.session_scale.max(1.0);
+        let scaled = scale > 1.01;
+        let fitted = Connection {
+            fullscreen: false,
+            multimon: false,
+            dynamic_resolution: !scaled,
+            width: ((area.width as f32 / scale).round() as u32).max(200),
+            height: ((area.height as f32 / scale).round() as u32).max(200),
+            ..conn.clone()
+        };
+        let resolved = self.config.resolve(&fitted);
+        let mut args = command::build_args(&resolved, &self.config.settings, creds)?;
+        if scaled {
+            args.push("/smart-sizing".to_string());
+        }
+        let holder = host.create_holder(area)?;
+        args.extend([
+            format!("/parent-window:{holder}"),
+            // Grabbing would keep the keyboard and pointer from the rest of the desktop.
+            "-grab-keyboard".to_string(),
+            "-grab-mouse".to_string(),
+        ]);
+        let spawned = Session::spawn_in_holder(
+            client,
+            &args,
+            conn.id,
+            conn.display_name().to_string(),
+            &self.bus,
+        );
+        match spawned {
+            Ok(mut session) => {
+                session.surface = Surface::Rdp {
+                    holder: Some(holder),
+                    placed: None,
+                    visible: false,
+                };
+                Ok(session)
+            }
+            Err(e) => {
+                host.destroy(holder);
+                Err(e)
+            }
+        }
+    }
+
+    /// Keeps session windows over the main area while they should show, and out of the way
+    /// of anything drawn on top. They're separate X11 windows, so they cover egui's drawing.
+    fn sync_session_windows(&mut self, ctx: &egui::Context) {
+        if let Some(uid) = self.active_session
+            && !self.sessions.iter().any(|s| s.uid == uid)
+        {
+            self.active_session = None;
+        }
+        let modal = self.modal_open();
+        let (active, area) = (self.active_session, self.session_area);
+        let Some(host) = &mut self.x11 else { return };
+        let mut shown = None;
+        let mut failure = None;
+        let mut connecting = false;
+        for s in &mut self.sessions {
+            let running = s.is_running();
+            let is_active = active == Some(s.uid);
+            let Surface::Rdp {
+                holder,
+                placed,
+                visible,
+            } = &mut s.surface
+            else {
+                continue;
+            };
+            let Some(id) = *holder else { continue };
+            if !running {
+                host.destroy(id);
+                *holder = None;
+                continue;
+            }
+            // Asking the X server takes a round trip, so only until the session has shown.
+            let wanted = area.filter(|_| is_active && !modal && (*visible || host.has_client(id)));
+            if is_active && !modal && wanted.is_none() {
+                connecting = true;
+            }
+            let mut sync = || -> Result<()> {
+                if let Some(area) = wanted {
+                    if *placed != Some(area) {
+                        host.place(id, area)?;
+                        *placed = Some(area);
+                    }
+                    shown = Some((id, area));
+                }
+                if wanted.is_some() != *visible {
+                    host.set_visible(id, wanted.is_some())?;
+                    *visible = wanted.is_some();
+                }
+                Ok(())
+            };
+            if let Err(e) = sync() {
+                failure = Some(e);
+            }
+        }
+        host.set_shown(shown);
+        if connecting {
+            // Nothing else says when the session's window has appeared.
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if let Some(e) = failure {
+            self.error(e);
+        }
+    }
+
+    /// The tabs above the main area, when any session is showing there.
+    fn session_tabs(&mut self, ui: &mut egui::Ui) {
+        let tabs: Vec<(usize, u64, String, bool)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.surface.in_main_window())
+            .map(|(i, s)| (i, s.uid, s.name.clone(), s.is_running()))
+            .collect();
+        if tabs.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.active_session.is_none(), "Connection")
+                .clicked()
+            {
+                self.actions.push(Action::ShowSession(None));
+            }
+            for (index, uid, name, running) in tabs {
+                ui.separator();
+                let text = if running {
+                    name.clone()
+                } else {
+                    format!("{name} (ended)")
+                };
+                if ui
+                    .selectable_label(self.active_session == Some(uid), text)
+                    .clicked()
+                {
+                    self.actions.push(Action::ShowSession(Some(uid)));
+                }
+                let close = ui
+                    .small_button("✕")
+                    .on_hover_text(if running { "Disconnect" } else { "Close" })
+                    .accessible_name(format!("Close {name}"))
+                    .clicked();
+                if close {
+                    self.actions.push(if running {
+                        Action::Stop(index)
+                    } else {
+                        Action::Dismiss(index)
+                    });
+                }
+            }
+        });
+        ui.separator();
+    }
+
+    /// The main area: a session if one is chosen, otherwise the connection form.
+    fn main_area(&mut self, ui: &mut egui::Ui) {
+        self.session_tabs(ui);
+        // Kept up to date even with no session showing, so a new one starts at the right size.
+        let rect = ui.available_rect_before_wrap();
+        let ppp = ui.ctx().pixels_per_point();
+        self.session_scale = ppp;
+        self.session_area = Some(Area {
+            x: (rect.left() * ppp).round() as i32,
+            y: (rect.top() * ppp).round() as i32,
+            width: (rect.width() * ppp).round().max(1.0) as u32,
+            height: (rect.height() * ppp).round().max(1.0) as u32,
+        });
+        let interactive = !self.modal_open();
+        let active = self.active_session;
+        let Some(session) = self.sessions.iter_mut().find(|s| Some(s.uid) == active) else {
+            return self.editor(ui);
+        };
+        let ended = match &session.status {
+            Status::Exited(d) => Some((d.title.clone(), d.hint.clone())),
+            Status::Running => None,
+        };
+        let (id, name) = (session.connection_id, session.name.clone());
+        let mut again = false;
+        let mut ended_bar = |ui: &mut egui::Ui| {
+            if let Some((title, hint)) = &ended {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(title);
+                    if !hint.is_empty() {
+                        ui.weak(hint);
+                    }
+                    again = ui.button("▶ Connect again").clicked();
+                });
+                ui.add_space(4.0);
+            }
+        };
+        match &mut session.surface {
+            Surface::Terminal(terminal) => {
+                ended_bar(ui);
+                terminal.show(ui, interactive);
+            }
+            Surface::Rdp { .. } => {
+                ended_bar(ui);
+                // Shows until the session's own window covers it.
+                if ended.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak(format!("Connecting to {name}…"));
+                    });
+                }
+            }
+            Surface::OwnWindow => {}
+        }
+        if again {
+            self.actions.push(Action::Connect(id));
         }
     }
 
@@ -1756,6 +2285,13 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙ Settings").clicked() {
                     self.settings_draft = Some(self.config.settings.clone());
+                }
+                if ui
+                    .button("💾 Backup")
+                    .on_hover_text("Save your connections to a file, or restore them from one")
+                    .clicked()
+                {
+                    self.backup_open = true;
                 }
                 if ui
                     .button("🔒 Certificates")
@@ -2053,6 +2589,24 @@ impl App {
                         })
                         .response
                     });
+                    row(ui, "Type", |ui| {
+                        ui.horizontal(|ui| {
+                            let was = c.protocol;
+                            ui.radio_value(&mut c.protocol, Protocol::Rdp, "RDP");
+                            ui.radio_value(&mut c.protocol, Protocol::Ssh, "SSH");
+                            if c.protocol != was && c.port == was.default_port() {
+                                c.port = c.protocol.default_port();
+                            }
+                        })
+                        .response
+                    });
+                    row(ui, "Open in", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut c.new_window, false, "This window");
+                            ui.radio_value(&mut c.new_window, true, "New window");
+                        })
+                        .response
+                    });
                     row(ui, "Host", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("hostname or IP"))
                     });
@@ -2070,6 +2624,12 @@ impl App {
                         };
                         ui.add(egui::TextEdit::singleline(&mut c.username).hint_text(hint))
                     });
+                    if c.protocol == Protocol::Ssh {
+                        row(ui, "Sign-in", |ui| {
+                            ui.weak("Uses your SSH keys, or asks for the password in the terminal.")
+                        });
+                        return;
+                    }
                     row(ui, "Domain", |ui| {
                         let hint = match group
                             .as_ref()
@@ -2104,239 +2664,259 @@ impl App {
                     }
                 });
 
-                section(ui, "Display", true, |ui| {
-                    row(ui, "Mode", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut c.fullscreen, false, "Window");
-                            ui.radio_value(&mut c.fullscreen, true, "Fullscreen");
-                        })
-                        .response
-                    });
-                    if c.fullscreen {
-                        row(ui, "", |ui| {
-                            ui.checkbox(&mut c.multimon, "Span all monitors")
-                        });
-                    } else {
-                        row(ui, "Size", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut c.width).range(640..=8192))
-                                    .accessible_name("Width");
-                                ui.label("×");
-                                ui.add(egui::DragValue::new(&mut c.height).range(480..=8192))
-                                    .accessible_name("Height");
-                                egui::ComboBox::from_id_salt("res_presets")
-                                    .selected_text("Presets")
-                                    .show_ui(ui, |ui| {
-                                        for &(w, h) in RESOLUTIONS {
-                                            if ui.button(format!("{w} × {h}")).clicked() {
-                                                (c.width, c.height) = (w, h);
-                                            }
-                                        }
+                if c.protocol == Protocol::Rdp {
+                    section(ui, "Display", true, |ui| {
+                        if !c.new_window {
+                            row(ui, "Size", |ui| {
+                                ui.weak("Fits the window, and resizes with it")
+                            });
+                        } else {
+                            row(ui, "Mode", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut c.fullscreen, false, "Window");
+                                    ui.radio_value(&mut c.fullscreen, true, "Fullscreen");
+                                })
+                                .response
+                            });
+                            if c.fullscreen {
+                                row(ui, "", |ui| {
+                                    ui.checkbox(&mut c.multimon, "Span all monitors")
+                                });
+                            } else {
+                                row(ui, "Size", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::DragValue::new(&mut c.width).range(640..=8192),
+                                        )
+                                        .accessible_name("Width");
+                                        ui.label("×");
+                                        ui.add(
+                                            egui::DragValue::new(&mut c.height).range(480..=8192),
+                                        )
+                                        .accessible_name("Height");
+                                        egui::ComboBox::from_id_salt("res_presets")
+                                            .selected_text("Presets")
+                                            .show_ui(ui, |ui| {
+                                                for &(w, h) in RESOLUTIONS {
+                                                    if ui.button(format!("{w} × {h}")).clicked() {
+                                                        (c.width, c.height) = (w, h);
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .accessible_name("Resolution presets");
                                     })
                                     .response
-                                    .accessible_name("Resolution presets");
-                            })
-                            .response
-                        });
-                    }
-                    row(ui, "", |ui| {
-                        ui.checkbox(
-                            &mut c.dynamic_resolution,
-                            "Resize remote desktop with the window",
-                        )
-                    });
-                    row(ui, "Scaling", |ui| {
-                        let options = [Scaling::Off, Scaling::Auto]
-                            .into_iter()
-                            .chain(Scaling::PRESETS.into_iter().skip(1).map(Scaling::Percent));
-                        egui::ComboBox::from_id_salt("scaling")
-                            .selected_text(c.scaling.label())
-                            .width(260.0)
-                            .show_ui(ui, |ui| {
-                                for o in options {
-                                    ui.selectable_value(&mut c.scaling, o, o.label());
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Makes text and icons in the remote desktop larger on \
-                                 high-DPI screens (/scale-desktop)",
-                            )
-                    });
-                });
-
-                section(ui, "Performance", true, |ui| {
-                    let inherited = group
-                        .as_ref()
-                        .and_then(|g| g.profile)
-                        .unwrap_or(Profile::DEFAULT);
-                    row(ui, "Profile", |ui| {
-                        inherit_combo(
-                            ui,
-                            "profile",
-                            &mut c.profile,
-                            &Profile::ALL,
-                            Profile::label,
-                            || format!("{} ({})", inherited.label(), group_label()),
-                        )
-                    });
-                    row(ui, "", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(
-                                &mut c.auto_reconnect,
-                                "Reconnect automatically if the network drops",
-                            );
-                        })
-                        .response
-                    });
-                    if c.auto_reconnect {
-                        row(ui, "Retries", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::DragValue::new(&mut c.reconnect_retries).range(0..=1000),
-                                )
-                                .accessible_name("Reconnect retries");
-                                ui.weak(if c.reconnect_retries == 0 {
-                                    "unlimited"
-                                } else {
-                                    "attempts"
                                 });
-                            })
-                            .response
-                        });
-                    }
-                });
-
-                section(ui, "Redirection", true, |ui| {
-                    row(ui, "Clipboard", |ui| {
-                        share_combo(ui, "clipboard_text", &mut c.clipboard_text).on_hover_text(
-                            "Copy and paste text and images between this computer and the \
-                             remote one",
-                        )
-                    });
-                    row(ui, "Files", |ui| {
-                        share_combo(ui, "clipboard_files", &mut c.clipboard_files).on_hover_text(
-                            "Copy and paste files between the computers. Pasting remote \
-                             files here needs FUSE.",
-                        )
-                    });
-                    row(ui, "", |ui| {
-                        ui.checkbox(&mut c.home_drive, "Home folder as a drive")
-                    });
-                    row(ui, "", |ui| {
-                        ui.checkbox(&mut c.sound, "Play remote audio locally")
-                    });
-                    row(ui, "", |ui| ui.checkbox(&mut c.microphone, "Microphone"));
-                });
-
-                section(ui, "Gateway", c.gateway != GatewayMode::Inherit, |ui| {
-                    row(ui, "Gateway", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut c.gateway, GatewayMode::Inherit, "From group");
-                            ui.radio_value(&mut c.gateway, GatewayMode::Off, "None");
-                            ui.radio_value(&mut c.gateway, GatewayMode::On, "Custom");
-                        })
-                        .response
-                    });
-                    match c.gateway {
-                        GatewayMode::Inherit => {
-                            let text = match &group {
-                                Some(g) if g.gateway_enabled => {
-                                    format!(
-                                        "Uses {} from group “{}”",
-                                        g.gateway_host.trim(),
-                                        g.name
-                                    )
-                                }
-                                Some(g) => format!("Group “{}” has no gateway", g.name),
-                                None => "No group gateway; connects directly".into(),
-                            };
-                            row(ui, "", |ui| ui.weak(text));
-                        }
-                        GatewayMode::Off => {}
-                        GatewayMode::On => {
-                            row(ui, "Host", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut c.gateway_host)
-                                        .hint_text("gateway[:port]"),
-                                )
-                            });
+                            }
                             row(ui, "", |ui| {
                                 ui.checkbox(
-                                    &mut c.gateway_same_credentials,
-                                    "Use the same credentials",
+                                    &mut c.dynamic_resolution,
+                                    "Resize remote desktop with the window",
                                 )
                             });
-                            if !c.gateway_same_credentials {
-                                row(ui, "Username", |ui| {
-                                    ui.text_edit_singleline(&mut c.gateway_username)
-                                });
-                                row(ui, "Domain", |ui| {
-                                    ui.text_edit_singleline(&mut c.gateway_domain)
-                                });
-                                row(ui, "Password", |ui| {
-                                    password_field(
-                                        ui,
-                                        "Gateway password",
-                                        &mut d.gateway_password,
-                                        c.has_saved_gateway_password,
-                                        || actions.push(Action::Forget(Key::Gateway(id))),
-                                    )
-                                });
-                            }
                         }
-                    }
-                });
-
-                section(
-                    ui,
-                    "Notes",
-                    !c.notes.is_empty() || !c.tags.is_empty(),
-                    |ui| {
-                        row(ui, "Tags", |ui| {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut d.tags_text)
-                                    .hint_text("comma separated, e.g. prod, sql")
-                                    .desired_width(f32::INFINITY),
-                            );
-                            if resp.changed() {
-                                c.tags = model::parse_tags(&d.tags_text);
-                            }
-                            resp
+                        row(ui, "Scaling", |ui| {
+                            let options = [Scaling::Off, Scaling::Auto]
+                                .into_iter()
+                                .chain(Scaling::PRESETS.into_iter().skip(1).map(Scaling::Percent));
+                            egui::ComboBox::from_id_salt("scaling")
+                                .selected_text(c.scaling.label())
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for o in options {
+                                        ui.selectable_value(&mut c.scaling, o, o.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Makes text and icons in the remote desktop larger on \
+                                 high-DPI screens (/scale-desktop)",
+                                )
                         });
-                        row(ui, "Notes", |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut c.notes)
-                                    .hint_text("Who owns it, what it's for… (searchable)")
-                                    .desired_rows(3)
-                                    .desired_width(f32::INFINITY),
+                    });
+
+                    section(ui, "Performance", true, |ui| {
+                        let inherited = group
+                            .as_ref()
+                            .and_then(|g| g.profile)
+                            .unwrap_or(Profile::DEFAULT);
+                        row(ui, "Profile", |ui| {
+                            inherit_combo(
+                                ui,
+                                "profile",
+                                &mut c.profile,
+                                &Profile::ALL,
+                                Profile::label,
+                                || format!("{} ({})", inherited.label(), group_label()),
                             )
                         });
-                    },
-                );
+                        row(ui, "", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(
+                                    &mut c.auto_reconnect,
+                                    "Reconnect automatically if the network drops",
+                                );
+                            })
+                            .response
+                        });
+                        if c.auto_reconnect {
+                            row(ui, "Retries", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut c.reconnect_retries)
+                                            .range(0..=1000),
+                                    )
+                                    .accessible_name("Reconnect retries");
+                                    ui.weak(if c.reconnect_retries == 0 {
+                                        "unlimited"
+                                    } else {
+                                        "attempts"
+                                    });
+                                })
+                                .response
+                            });
+                        }
+                    });
+
+                    section(ui, "Redirection", true, |ui| {
+                        row(ui, "Clipboard", |ui| {
+                            share_combo(ui, "clipboard_text", &mut c.clipboard_text).on_hover_text(
+                                "Copy and paste text and images between this computer and the \
+                             remote one",
+                            )
+                        });
+                        row(ui, "Files", |ui| {
+                            share_combo(ui, "clipboard_files", &mut c.clipboard_files)
+                                .on_hover_text(
+                                    "Copy and paste files between the computers. Pasting remote \
+                             files here needs FUSE.",
+                                )
+                        });
+                        row(ui, "", |ui| {
+                            ui.checkbox(&mut c.home_drive, "Home folder as a drive")
+                        });
+                        row(ui, "", |ui| {
+                            ui.checkbox(&mut c.sound, "Play remote audio locally")
+                        });
+                        row(ui, "", |ui| ui.checkbox(&mut c.microphone, "Microphone"));
+                    });
+
+                    section(ui, "Gateway", c.gateway != GatewayMode::Inherit, |ui| {
+                        row(ui, "Gateway", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut c.gateway, GatewayMode::Inherit, "From group");
+                                ui.radio_value(&mut c.gateway, GatewayMode::Off, "None");
+                                ui.radio_value(&mut c.gateway, GatewayMode::On, "Custom");
+                            })
+                            .response
+                        });
+                        match c.gateway {
+                            GatewayMode::Inherit => {
+                                let text = match &group {
+                                    Some(g) if g.gateway_enabled => {
+                                        format!(
+                                            "Uses {} from group “{}”",
+                                            g.gateway_host.trim(),
+                                            g.name
+                                        )
+                                    }
+                                    Some(g) => format!("Group “{}” has no gateway", g.name),
+                                    None => "No group gateway; connects directly".into(),
+                                };
+                                row(ui, "", |ui| ui.weak(text));
+                            }
+                            GatewayMode::Off => {}
+                            GatewayMode::On => {
+                                row(ui, "Host", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut c.gateway_host)
+                                            .hint_text("gateway[:port]"),
+                                    )
+                                });
+                                row(ui, "", |ui| {
+                                    ui.checkbox(
+                                        &mut c.gateway_same_credentials,
+                                        "Use the same credentials",
+                                    )
+                                });
+                                if !c.gateway_same_credentials {
+                                    row(ui, "Username", |ui| {
+                                        ui.text_edit_singleline(&mut c.gateway_username)
+                                    });
+                                    row(ui, "Domain", |ui| {
+                                        ui.text_edit_singleline(&mut c.gateway_domain)
+                                    });
+                                    row(ui, "Password", |ui| {
+                                        password_field(
+                                            ui,
+                                            "Gateway password",
+                                            &mut d.gateway_password,
+                                            c.has_saved_gateway_password,
+                                            || actions.push(Action::Forget(Key::Gateway(id))),
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    });
+
+                    section(
+                        ui,
+                        "Notes",
+                        !c.notes.is_empty() || !c.tags.is_empty(),
+                        |ui| {
+                            row(ui, "Tags", |ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut d.tags_text)
+                                        .hint_text("comma separated, e.g. prod, sql")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if resp.changed() {
+                                    c.tags = model::parse_tags(&d.tags_text);
+                                }
+                                resp
+                            });
+                            row(ui, "Notes", |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut c.notes)
+                                        .hint_text("Who owns it, what it's for… (searchable)")
+                                        .desired_rows(3)
+                                        .desired_width(f32::INFINITY),
+                                )
+                            });
+                        },
+                    );
+                }
 
                 section(ui, "Advanced", false, |ui| {
-                    let inherited = group
-                        .as_ref()
-                        .and_then(|g| g.cert)
-                        .unwrap_or(CertPolicy::DEFAULT);
-                    row(ui, "Certificate", |ui| {
-                        inherit_combo(
-                            ui,
-                            "cert",
-                            &mut c.cert,
-                            &CertPolicy::ALL,
-                            CertPolicy::label,
-                            || format!("{} ({})", inherited.label(), group_label()),
-                        )
-                    });
-                    row(ui, "", |ui| {
-                        ui.checkbox(&mut c.admin, "Admin / console session")
-                    });
+                    if c.protocol == Protocol::Rdp {
+                        let inherited = group
+                            .as_ref()
+                            .and_then(|g| g.cert)
+                            .unwrap_or(CertPolicy::DEFAULT);
+                        row(ui, "Certificate", |ui| {
+                            inherit_combo(
+                                ui,
+                                "cert",
+                                &mut c.cert,
+                                &CertPolicy::ALL,
+                                CertPolicy::label,
+                                || format!("{} ({})", inherited.label(), group_label()),
+                            )
+                        });
+                        row(ui, "", |ui| {
+                            ui.checkbox(&mut c.admin, "Admin / console session")
+                        });
+                    }
+                    let example = match c.protocol {
+                        Protocol::Rdp => "e.g. /kbd:layout:0x409",
+                        Protocol::Ssh => "e.g. -i ~/.ssh/work_key",
+                    };
                     row(ui, "Extra args", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut c.extra_args)
-                                .hint_text("e.g. /kbd:layout:0x409")
+                                .hint_text(example)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY),
                         )
@@ -2777,6 +3357,19 @@ impl App {
                                 .accessible_name("Client presets");
                         });
                         ui.end_row();
+                        ui.label("Terminal");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut s.terminal)
+                                .hint_text("automatic (for SSH in a new window)"),
+                        )
+                        .accessible_name("Terminal")
+                        .on_hover_text(
+                            "The name of a terminal, or a full command such as \
+                             “konsole --nofork -e”; ssh is added to its end. It should keep \
+                             running until the session ends, or the session list shows the \
+                             session as ended.",
+                        );
+                        ui.end_row();
                         ui.label("Log level");
                         egui::ComboBox::from_id_salt("log_level")
                             .selected_text(s.log_level.as_str())
@@ -2817,7 +3410,10 @@ impl App {
                         ui.end_row();
                     });
                 ui.add_space(4.0);
-                ui.weak("sdl-freerdp is recommended on Wayland.");
+                ui.weak(
+                    "sdl-freerdp is recommended on Wayland. Sessions inside the main window use \
+                     xfreerdp, the only client that can draw there.",
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -2977,6 +3573,134 @@ impl App {
             }
         }
 
+        if self.backup_open {
+            let mut close = false;
+            let resp = egui::Modal::new(egui::Id::unique("backup")).show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.heading("Backup and restore");
+                ui.label(
+                    "A backup holds your connections, groups and settings, to move to another \
+                     computer or to keep safe.",
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    "Passwords and trusted certificates are not included: you'll be asked for \
+                     passwords again, and to accept certificates as if connecting for the first \
+                     time.",
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    "Extra arguments and notes are saved as you typed them, so keep the file \
+                     private if they hold anything sensitive.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Back up…").clicked() {
+                        self.actions.push(Action::Backup);
+                    }
+                    if ui.button("Restore…").clicked() {
+                        self.actions.push(Action::PickRestore);
+                    }
+                    close = ui.button("Close").clicked();
+                });
+            });
+            if close || resp.should_close() {
+                self.backup_open = false;
+            }
+        }
+
+        if let Some(pending) = &self.restore {
+            let backup = &pending.backup;
+            let broken = self.load_error.is_some();
+            let add = backup.preview(&self.config, RestoreMode::Add);
+            let replace = backup.preview(&self.config, RestoreMode::Replace);
+            let mut close = false;
+            let resp = egui::Modal::new(egui::Id::unique("restore")).show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.heading("Restore this backup?");
+                ui.label(RichText::new(&pending.file).small());
+                ui.add_space(4.0);
+                let created = match backup.created.as_str() {
+                    "" => String::new(),
+                    when => format!("Made {when}: "),
+                };
+                ui.label(format!(
+                    "{created}{} and {}.",
+                    counted(backup.connections.len(), "connection"),
+                    counted(backup.groups.len(), "group"),
+                ));
+                if backup.risky_entries() > 0 {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "{} extra FreeRDP arguments or skipped certificate checks. Only \
+                             restore this if you trust where the file came from.",
+                            match backup.risky_entries() {
+                                1 => "1 entry uses".to_string(),
+                                n => format!("{n} entries use"),
+                            },
+                        ),
+                    );
+                }
+                ui.add_space(8.0);
+                if !broken {
+                    ui.label(RichText::new("Add what's missing").strong());
+                    ui.label(format!(
+                        "Adds {} and {}. Nothing you have now changes.",
+                        counted(add.added_connections, "connection"),
+                        counted(add.added_groups, "group"),
+                    ));
+                    ui.add_space(6.0);
+                }
+                if !backup.is_empty() {
+                    ui.label(RichText::new("Replace everything").strong());
+                    let mut text = "Connections, groups and settings become what's in the \
+                                    backup, and a copy of your current setup is kept first."
+                        .to_string();
+                    if replace.removed_connections + replace.removed_groups > 0 {
+                        text.push_str(&format!(
+                            " This removes {} and {} that the backup doesn't have.",
+                            counted(replace.removed_connections, "connection"),
+                            counted(replace.removed_groups, "group"),
+                        ));
+                    }
+                    if backup.changes_programs(&self.config) {
+                        text.push_str(
+                            " It also changes the FreeRDP client or terminal program this \
+                             computer runs; check them in Settings afterwards.",
+                        );
+                    }
+                    if !replace.stale_passwords.is_empty() {
+                        text.push_str(&format!(
+                            " {} saved with those can't be brought back, even from that copy.",
+                            counted(replace.stale_passwords.len(), "password"),
+                        ));
+                    }
+                    ui.label(text);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let nothing_to_add = add.added_connections + add.added_groups == 0;
+                    if !broken
+                        && ui
+                            .add_enabled(!nothing_to_add, egui::Button::new("Add what's missing"))
+                            .on_disabled_hover_text("You already have everything in this backup")
+                            .clicked()
+                    {
+                        self.actions.push(Action::Restore(RestoreMode::Add));
+                    }
+                    if !backup.is_empty() && ui.button("Replace everything").clicked() {
+                        self.actions.push(Action::Restore(RestoreMode::Replace));
+                    }
+                    close = ui.button("Cancel").clicked();
+                });
+            });
+            if close || resp.should_close() {
+                self.restore = None;
+            }
+        }
+
         if let Some(forget) = &self.confirm_forget_cert {
             let mut close = false;
             let asks = self.config.settings.client.contains("sdl");
@@ -3128,6 +3852,10 @@ impl eframe::App for Window<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         eframe::App::ui(self.0, ui, frame);
     }
+
+    fn on_exit(&mut self) {
+        self.0.detach_sessions();
+    }
 }
 
 impl App {
@@ -3154,11 +3882,18 @@ impl App {
         if let Some(n) = self.inbox.lock().unwrap().pop() {
             self.notice = Some(n);
         }
+        let opened = self.restore_inbox.lock().unwrap().take();
+        match opened {
+            Some(Ok(pending)) => self.restore = Some(pending),
+            Some(Err(e)) => self.error(anyhow::anyhow!(e)),
+            None => {}
+        }
 
         let any_running = self.sessions.iter().any(Session::is_running);
         if any_running {
             // Keep the elapsed-time display, reconnect state and exit detection ticking.
-            ctx.request_repaint_after(Duration::from_millis(500));
+            // Not more often: on a large window, a frame isn't free.
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.tray_active() {
@@ -3201,9 +3936,10 @@ impl App {
             .default_size(250.0)
             .size_range(180.0..=420.0)
             .show(ui, |ui| self.connection_list(ui));
-        egui::CentralPanel::default_margins().show(ui, |ui| self.editor(ui));
+        egui::CentralPanel::default_margins().show(ui, |ui| self.main_area(ui));
 
         self.modals(&ctx);
+        self.sync_session_windows(&ctx);
 
         for action in std::mem::take(&mut self.actions) {
             self.apply(action, &ctx);
@@ -3273,6 +4009,17 @@ fn connection_row(
     text.append(c.display_name(), 0.0, fmt(ui.visuals().text_color()));
     if c.favorite {
         text.append(" ★", 0.0, fmt(AMBER));
+    }
+    if c.protocol == Protocol::Ssh {
+        text.append(
+            "  SSH",
+            0.0,
+            egui::TextFormat {
+                color: ui.visuals().weak_text_color(),
+                font_id: egui::FontId::proportional(11.0),
+                ..Default::default()
+            },
+        );
     }
     if !c.tags.is_empty() {
         let tags: Vec<String> = c.tags.iter().map(|t| format!("#{t}")).collect();
@@ -3438,24 +4185,62 @@ fn command_preview(
     settings: &Settings,
     creds: &Credentials,
 ) {
+    let preview_row = |ui: &mut egui::Ui, preview: String| {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(RichText::new(&preview).monospace().weak()).wrap());
+            if ui
+                .small_button("📋")
+                .on_hover_text("Copy (passwords masked)")
+                .clicked()
+            {
+                ui.ctx().copy_text(preview.clone());
+            }
+        });
+    };
+    if resolved.conn.protocol == Protocol::Ssh {
+        match command::ssh_args(resolved) {
+            Ok(args) => preview_row(ui, command::preview("ssh", &args)),
+            Err(e) => {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("{e:#}"));
+            }
+        }
+        return;
+    }
     match command::build_args(resolved, settings, creds) {
         Ok(args) => {
-            let preview = command::preview(&settings.client, &args);
-            ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Label::new(RichText::new(&preview).monospace().weak()).wrap());
-                if ui
-                    .small_button("📋")
-                    .on_hover_text("Copy (passwords masked)")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(preview.clone());
-                }
-            });
+            preview_row(ui, command::preview(&settings.client, &args));
             ui.weak("Arguments are passed via /args-from:stdin, so passwords never appear in the process list.");
         }
         Err(e) => {
             ui.colored_label(ui.visuals().warn_fg_color, format!("{e:#}"));
         }
+    }
+}
+
+fn holder_of(session: &Session) -> Option<u32> {
+    match session.surface {
+        Surface::Rdp { holder, .. } => holder,
+        _ => None,
+    }
+}
+
+/// "1 connection", "2 connections".
+fn counted(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// A file dialog for backups, starting in the documents folder.
+fn backup_dialog(title: &str) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Backup", &["toml"]);
+    match directories::UserDirs::new().and_then(|u| u.document_dir().map(|p| p.to_path_buf())) {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
     }
 }
 
@@ -4256,6 +5041,459 @@ mod ui_tests {
                  window {window_left}..{window_right}"
             );
         }
+    }
+
+    fn pending_restore(backup: Backup) -> PendingRestore {
+        PendingRestore {
+            backup,
+            file: "/nonexistent/backup.toml".into(),
+        }
+    }
+
+    fn files_before_restore(env: &TestEnv) -> Vec<PathBuf> {
+        std::fs::read_dir(&env.dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("before-restore-"))
+            .collect()
+    }
+
+    #[test]
+    fn backup_window_opens_from_the_top_bar_and_closes() {
+        let env = TestEnv::new("backupwindow");
+        let mut h = env.harness();
+        h.get_by_label("💾 Backup").click();
+        h.run_steps(3);
+        assert!(h.state().backup_open);
+        assert!(has_label(&h, "Passwords and trusted certificates are not"));
+        h.get_by_label("Close").click();
+        h.run_steps(3);
+        assert!(!h.state().backup_open);
+    }
+
+    #[test]
+    fn adding_from_a_backup_keeps_what_is_here_and_is_saved() {
+        let env = TestEnv::new("restoreadd");
+        let mut h = env.harness();
+        let mut backup = Backup::of(&h.state().config);
+        backup.connections[0].notes = "from the backup".into();
+        backup.connections.push(Connection {
+            name: "Gamma".into(),
+            host: "gamma.example.org".into(),
+            ..Default::default()
+        });
+        h.state_mut().restore = Some(pending_restore(backup));
+        h.run_steps(3);
+        assert!(has_label(&h, "Adds 1 connection and 0 groups"));
+
+        h.get_by_role_and_label(Role::Button, "Add what's missing")
+            .click();
+        h.run_steps(3);
+
+        assert!(h.state().restore.is_none());
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert_eq!(saved.connections.len(), 3);
+        assert_ne!(saved.connections[0].notes, "from the backup");
+        assert!(saved.connections.iter().any(|c| c.name == "Gamma"));
+        assert!(files_before_restore(&env).is_empty(), "nothing was at risk");
+    }
+
+    #[test]
+    fn replacing_keeps_a_restorable_copy_and_drops_a_removed_selection() {
+        let env = TestEnv::new("restorereplace");
+        let mut h = env.harness();
+        let original = h.state().config.connections.clone();
+        let (alpha, beta) = (original[0].id, original[1].id);
+        let mut backup = Backup::of(&h.state().config);
+        backup.connections.retain(|c| c.id == alpha);
+        backup.settings.accordion = !h.state().config.settings.accordion;
+        h.state_mut().actions.push(Action::Select(beta));
+        h.run_steps(2);
+        h.state_mut().restore = Some(pending_restore(backup));
+        h.run_steps(3);
+        assert!(has_label(&h, "This removes 1 connection and 0 groups"));
+
+        h.get_by_role_and_label(Role::Button, "Replace everything")
+            .click();
+        h.run_steps(3);
+
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert_eq!(saved.connections.len(), 1);
+        assert_eq!(saved.connections[0].id, alpha);
+        assert!(h.state().draft.is_none(), "the selected connection is gone");
+        assert_eq!(
+            saved.settings.accordion,
+            h.state().config.settings.accordion
+        );
+
+        let kept = files_before_restore(&env);
+        assert_eq!(kept.len(), 1);
+        let kept = Backup::read(&kept[0]).unwrap();
+        assert_eq!(kept.connections.len(), 2, "the copy holds the old setup");
+        assert!(kept.connections.iter().any(|c| c.id == beta));
+    }
+
+    #[test]
+    fn pending_edits_are_saved_before_a_restore_uses_them() {
+        let env = TestEnv::new("restoreedits");
+        let mut h = env.harness();
+        let backup = Backup::of(&h.state().config);
+        let alpha = h.state().config.connections[0].id;
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(2);
+        h.state_mut().draft.as_mut().unwrap().conn.notes = "typed just now".into();
+        h.state_mut().restore = Some(pending_restore(backup));
+        h.run_steps(3);
+        h.state_mut()
+            .actions
+            .push(Action::Restore(RestoreMode::Replace));
+        h.run_steps(3);
+
+        // The backup wins, but the edit is in the copy kept first.
+        assert_ne!(h.state().find(alpha).unwrap().notes, "typed just now");
+        assert_ne!(
+            h.state().draft.as_ref().unwrap().conn.notes,
+            "typed just now"
+        );
+        let kept = Backup::read(&files_before_restore(&env)[0]).unwrap();
+        assert_eq!(kept.connections[0].notes, "typed just now");
+    }
+
+    #[test]
+    fn a_config_that_failed_to_load_can_be_replaced_but_not_backed_up() {
+        let env = TestEnv::new("restorebroken");
+        let backup = Backup::of(&Config::load(&env.config_path()).unwrap());
+        std::fs::write(env.config_path(), "this is = = broken").unwrap();
+        let mut h = env.harness();
+        assert!(h.state().load_error.is_some());
+
+        h.state_mut().actions.push(Action::Backup);
+        h.run_steps(2);
+        assert!(h.state().notice.as_ref().is_some_and(|(_, err)| *err));
+        assert_eq!(
+            std::fs::read_to_string(env.config_path()).unwrap(),
+            "this is = = broken"
+        );
+
+        h.state_mut().restore = Some(pending_restore(backup.clone()));
+        h.run_steps(3);
+        assert!(
+            h.query_by_role_and_label(Role::Button, "Add what's missing")
+                .is_none()
+        );
+        h.get_by_role_and_label(Role::Button, "Replace everything")
+            .click();
+        h.run_steps(3);
+
+        assert!(h.state().load_error.is_none());
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert_eq!(saved.connections.len(), backup.connections.len());
+        let kept = &files_before_restore(&env)[0];
+        assert_eq!(
+            std::fs::read_to_string(kept).unwrap(),
+            "this is = = broken",
+            "the broken file is kept for repairing by hand"
+        );
+    }
+
+    #[test]
+    fn a_warning_shows_for_a_backup_that_changes_safety_settings() {
+        let env = TestEnv::new("restorerisky");
+        let mut h = env.harness();
+        let mut backup = Backup::of(&h.state().config);
+        h.state_mut().restore = Some(pending_restore(backup.clone()));
+        h.run_steps(3);
+        assert!(!has_label(&h, "trust where the file came from"));
+
+        backup.connections[0].extra_args = "/drive:all,/".into();
+        h.state_mut().restore = Some(pending_restore(backup));
+        h.run_steps(3);
+        assert!(has_label(&h, "1 entry uses"));
+        assert!(has_label(&h, "trust where the file came from"));
+    }
+
+    /// Makes the first connection SSH, with a terminal that records what it was asked to
+    /// run and then stays open until told to end.
+    fn use_ssh(env: &TestEnv, h: &mut Harness<'static, App>) -> (Uuid, PathBuf) {
+        let seen = env.dir.join("terminal-args");
+        let terminal = env.dir.join("fake-terminal");
+        std::fs::write(
+            &terminal,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do echo \"[$a]\" >> '{}'; done\nexec sleep 30\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = h.state_mut();
+        state.config.settings.terminal = terminal.to_string_lossy().into_owned();
+        let c = &mut state.config.connections[0];
+        c.protocol = Protocol::Ssh;
+        c.host = "pc1".into();
+        c.port = 2222;
+        c.username = "bob".into();
+        c.new_window = true;
+        (c.id, seen)
+    }
+
+    fn wait_for_file(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.contains("[--]")
+            {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the terminal didn't start");
+    }
+
+    #[test]
+    fn ssh_opens_a_terminal_without_asking_for_a_password() {
+        let env = TestEnv::new("sshlaunch");
+        let mut h = env.harness();
+        let (id, seen) = use_ssh(&env, &mut h);
+
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(3);
+
+        assert!(h.state().prompt.is_none(), "ssh asks in the terminal");
+        let args = wait_for_file(&seen);
+        assert!(
+            args.ends_with("[ssh]\n[-p]\n[2222]\n[-l]\n[bob]\n[--]\n[pc1]\n"),
+            "{args}"
+        );
+        assert!(h.state().sessions[0].is_running());
+        assert_eq!(h.state().sessions[0].command, "ssh -p 2222 -l bob -- pc1");
+
+        // A second SSH session is fine, so it isn't questioned.
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(3);
+        assert!(h.state().confirm_second.is_none());
+        assert_eq!(h.state().sessions.len(), 2);
+
+        for i in 0..2 {
+            h.state_mut().actions.push(Action::Stop(i));
+        }
+        h.run_steps(2);
+        wait_for_sessions(&mut h);
+        let Status::Exited(d) = &h.state().sessions[0].status else {
+            panic!("still running");
+        };
+        assert_eq!(d.title, "Disconnected");
+    }
+
+    /// Makes the first connection SSH inside the main window, with `script` for `ssh`.
+    fn use_ssh_in_main_window(env: &TestEnv, h: &mut Harness<'static, App>, script: &str) -> Uuid {
+        let fake = env.dir.join("fake-ssh");
+        std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = h.state_mut();
+        state.ssh_program = fake.to_string_lossy().into_owned();
+        let c = &mut state.config.connections[0];
+        c.protocol = Protocol::Ssh;
+        c.host = "pc1".into();
+        c.id
+    }
+
+    fn wait_until(h: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done(h.state()) {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ssh_opens_in_the_main_window_and_takes_the_keyboard() {
+        let env = TestEnv::new("sshhere");
+        let mut h = env.harness();
+        let seen = env.dir.join("typed");
+        let id = use_ssh_in_main_window(
+            &env,
+            &mut h,
+            &format!(
+                "read -r line; echo \"$line\" > '{}'; exit 0",
+                seen.display()
+            ),
+        );
+        h.state_mut().actions.push(Action::Select(id));
+        h.run_steps(2);
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(3);
+
+        assert!(h.state().prompt.is_none());
+        let uid = h.state().sessions[0].uid;
+        assert_eq!(h.state().active_session, Some(uid));
+        assert!(
+            h.query_by_label("Connection").is_some(),
+            "the tab back to the form"
+        );
+        assert!(!has_label(&h, "Display"), "the terminal replaces the form");
+        h.run_steps(3);
+
+        // Ctrl+N belongs to the remote machine now, not to "new connection".
+        h.key_press_modifiers(Modifiers::CTRL, KeyCode::N);
+        h.run_steps(2);
+        assert!(!h.state().draft.as_ref().is_some_and(|d| d.is_new));
+
+        h.event(egui::Event::Text("hello".into()));
+        h.key_press(KeyCode::Enter);
+        h.run_steps(2);
+        wait_until(&mut h, "the program to end", |app| {
+            !app.sessions[0].is_running()
+        });
+        // Ctrl+N (0x0e) came first, then the text.
+        assert_eq!(std::fs::read(&seen).unwrap(), b"\x0ehello\n");
+
+        // Its screen stays until closed, which also goes back to the form.
+        assert_eq!(h.state().active_session, Some(uid));
+        h.run_steps(2);
+        assert!(has_label(&h, "Connect again"));
+        h.state_mut().actions.push(Action::Dismiss(0));
+        h.run_steps(3);
+        assert!(h.state().active_session.is_none());
+        assert!(has_label(&h, "General"));
+    }
+
+    #[test]
+    fn switching_tabs_and_selecting_a_connection_leave_a_session_running() {
+        let env = TestEnv::new("sshtabs");
+        let mut h = env.harness();
+        let id = use_ssh_in_main_window(&env, &mut h, "exec sleep 30");
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(3);
+        let uid = h.state().sessions[0].uid;
+
+        let other = h.state().config.connections[1].id;
+        h.state_mut().actions.push(Action::Select(other));
+        h.run_steps(3);
+        assert!(h.state().active_session.is_none());
+        assert!(h.state().sessions[0].is_running());
+
+        h.state_mut().actions.push(Action::ShowSession(Some(uid)));
+        h.run_steps(3);
+        assert_eq!(h.state().active_session, Some(uid));
+
+        h.state_mut().actions.push(Action::Stop(0));
+        h.run_steps(2);
+        wait_until(&mut h, "the session to end", |app| {
+            !app.sessions[0].is_running()
+        });
+        let Status::Exited(d) = &h.state().sessions[0].status else {
+            panic!("still running");
+        };
+        assert_eq!(d.title, "Disconnected");
+    }
+
+    #[test]
+    fn a_failed_ssh_connection_says_so_and_keeps_its_screen() {
+        let env = TestEnv::new("sshfail");
+        let mut h = env.harness();
+        let id = use_ssh_in_main_window(&env, &mut h, "echo refused; exit 255");
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(2);
+        wait_until(&mut h, "the session to end", |app| {
+            !app.sessions[0].is_running()
+        });
+        let Status::Exited(d) = &h.state().sessions[0].status else {
+            panic!("still running");
+        };
+        assert_eq!(d.severity, Severity::Failed);
+        assert!(h.state().active_session.is_some());
+    }
+
+    /// With no X11 main window (as here) an RDP session has to use its own.
+    #[test]
+    fn rdp_uses_its_own_window_when_it_can_not_be_embedded() {
+        let env = TestEnv::new("rdpown");
+        let mut h = env.harness();
+        let id = h.state().config.connections[0].id;
+        h.state_mut().actions.push(Action::Connect(id));
+        h.run_steps(3);
+        if let Some(p) = h.state_mut().prompt.as_mut() {
+            p.password = "x".into();
+        }
+        h.state_mut().actions.push(Action::Launch);
+        h.run_steps(3);
+        assert!(matches!(h.state().sessions[0].surface, Surface::OwnWindow));
+        assert!(h.state().active_session.is_none());
+    }
+
+    #[test]
+    fn the_open_in_choice_is_saved_per_connection() {
+        let env = TestEnv::new("openin");
+        let mut h = env.harness();
+        let id = h.state().config.connections[0].id;
+        h.state_mut().actions.push(Action::Select(id));
+        h.run_steps(3);
+        assert!(
+            !h.state().draft.as_ref().unwrap().conn.new_window,
+            "default"
+        );
+        assert!(!has_label(&h, "Fullscreen"), "the window decides the size");
+
+        h.get_by_role_and_label(Role::RadioButton, "New window")
+            .click();
+        h.run_steps(3);
+        assert!(has_label(&h, "Fullscreen"));
+        h.state_mut().actions.push(Action::Save);
+        h.run_steps(2);
+        let saved = Config::load(&env.config_path()).unwrap();
+        assert!(saved.connections[0].new_window);
+        assert!(!saved.connections[1].new_window);
+    }
+
+    #[test]
+    fn ssh_ignores_a_groups_gateway_and_saved_password() {
+        let env = TestEnv::new("sshgroup");
+        let mut h = env.harness();
+        let state = h.state_mut();
+        state.config.groups[0].gateway_enabled = true;
+        state.config.groups[0].gateway_host = "gw.example.org".into();
+        state.config.groups[0].has_saved_password = true;
+        let c = state
+            .config
+            .connections
+            .iter_mut()
+            .find(|c| c.group == "Work")
+            .unwrap();
+        c.protocol = Protocol::Ssh;
+        c.username = String::new();
+        let c = c.clone();
+        let r = h.state().config.resolve(&c);
+        assert!(r.gateway.is_none());
+        assert!(r.password_key.is_none());
+        assert_eq!(r.username, "svc", "the group's username still applies");
+    }
+
+    #[test]
+    fn the_form_shows_only_what_ssh_uses_and_switching_changes_the_default_port() {
+        let env = TestEnv::new("sshform");
+        let mut h = env.harness();
+        let alpha = h.state().config.connections[0].id;
+        h.state_mut().actions.push(Action::Select(alpha));
+        h.run_steps(3);
+        assert!(has_label(&h, "Display"));
+        assert!(has_label(&h, "Domain"));
+
+        h.get_by_role_and_label(Role::RadioButton, "SSH").click();
+        h.run_steps(3);
+        assert_eq!(h.state().draft.as_ref().unwrap().conn.port, 22);
+        assert!(!has_label(&h, "Display"));
+        assert!(!has_label(&h, "Domain"));
+        assert!(!has_label(&h, "Gateway"));
+
+        // A port chosen by hand stays when switching.
+        h.state_mut().draft.as_mut().unwrap().conn.port = 2222;
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::RadioButton, "RDP").click();
+        h.run_steps(3);
+        assert_eq!(h.state().draft.as_ref().unwrap().conn.port, 2222);
+        assert!(has_label(&h, "Display"));
     }
 
     /// Replaces the connection's client with one that runs until it is stopped.
